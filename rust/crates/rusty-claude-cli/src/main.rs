@@ -8,7 +8,9 @@
 )]
 mod init;
 mod input;
+mod llm_config;
 mod render;
+mod tui;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -21,11 +23,12 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    resolve_startup_auth_source, AnthropicClient, ApiError, AuthSource, ContentBlockDelta,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OpenAiCompatClient,
+    OpenAiCompatConfig, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
@@ -53,6 +56,8 @@ use serde_json::json;
 use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
+/// Installed binary name (`Cargo.toml` `[[bin]]`); used in `--help` and errors.
+const CLI_BIN: &str = "scream";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -84,20 +89,25 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--resume",
     "--print",
     "-p",
+    "--tui",
+    "--line-repl",
+    "--classic-repl",
 ];
 
 type AllowedToolSet = BTreeSet<String>;
 
 fn main() {
+    load_dotenv_best_effort();
     if let Err(error) = run() {
         let message = error.to_string();
-        if message.contains("`claw --help`") {
+        let help_hint = format!("`{CLI_BIN} --help`");
+        if message.contains(&help_hint) {
             eprintln!("error: {message}");
         } else {
             eprintln!(
                 "error: {message}
 
-Run `claw --help` for usage."
+Run `{CLI_BIN} --help` for usage."
             );
         }
         std::process::exit(1);
@@ -105,6 +115,8 @@ Run `claw --help` for usage."
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    llm_config::apply_active_model_default();
+
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
         CliAction::DumpManifests => dump_manifests(),
@@ -129,8 +141,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, true, allowed_tools, permission_mode)?
-            .run_turn_with_output(&prompt, output_format)?,
+        } => {
+            ensure_any_llm_credentials_configured()?;
+            LiveCli::new(model, true, allowed_tools, permission_mode)?
+                .run_turn_with_output(&prompt, output_format)?;
+        }
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
         CliAction::Init => run_init()?,
@@ -138,7 +153,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+            tui,
+        } => {
+            if tui {
+                // 全屏 TUI：仅 UI；LLM 与斜杠指令由 Python `QueryEnginePort`（`repl --json-stdio`）执行。
+                tui::run_tui_repl()?;
+            } else {
+                ensure_any_llm_credentials_configured()?;
+                run_repl(model, allowed_tools, permission_mode)?;
+            }
+        }
         CliAction::Help => print_help(),
     }
     Ok(())
@@ -185,6 +209,7 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        tui: bool,
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help,
@@ -209,14 +234,97 @@ impl CliOutputFormat {
 }
 
 #[allow(clippy::too_many_lines)]
+fn env_var_nonempty(name: &str) -> bool {
+    env::var(name)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn default_model_from_env() -> String {
+    if let Ok(m) = env::var("MODEL") {
+        let t = m.trim();
+        if !t.is_empty() {
+            return api::resolve_model_alias(t);
+        }
+    }
+    let anthropic_ready = api::anthropic_auth_configured();
+    let compat_anthropic_stack_keys = env_var_nonempty("DEEPSEEK_API_KEY")
+        || env_var_nonempty("DASHSCOPE_API_KEY")
+        || env_var_nonempty("MOONSHOT_API_KEY")
+        || env_var_nonempty("MINIMAX_API_KEY")
+        || env_var_nonempty("MINIMAX_2_API_KEY");
+    if anthropic_ready || compat_anthropic_stack_keys {
+        return DEFAULT_MODEL.to_string();
+    }
+    // OpenAI-compatible .env (OPENAI_API_KEY or generic API_KEY) without Anthropic-shaped auth.
+    let openai_ready = env_var_nonempty("OPENAI_API_KEY") || env_var_nonempty("API_KEY");
+    if openai_ready {
+        return "gpt-4o-mini".to_string();
+    }
+    if env_var_nonempty("XAI_API_KEY") {
+        return "grok-3".to_string();
+    }
+    DEFAULT_MODEL.to_string()
+}
+
+fn has_any_llm_credential() -> bool {
+    api::anthropic_auth_configured()
+        || llm_config::try_resolve_active_profile().is_some()
+        || env_var_nonempty("OPENAI_API_KEY")
+        || env_var_nonempty("XAI_API_KEY")
+        || env_var_nonempty("API_KEY")
+        || env_var_nonempty("DEEPSEEK_API_KEY")
+        || env_var_nonempty("DASHSCOPE_API_KEY")
+        || env_var_nonempty("MOONSHOT_API_KEY")
+        || env_var_nonempty("MINIMAX_API_KEY")
+        || env_var_nonempty("MINIMAX_2_API_KEY")
+}
+
+fn ensure_any_llm_credentials_configured() -> Result<(), Box<dyn std::error::Error>> {
+    if has_any_llm_credential() {
+        return Ok(());
+    }
+    Err(format!(
+        "Scream Code needs at least one LLM API key. Set one in `.env` or the environment (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, API_KEY with optional BASE_URL, DEEPSEEK_API_KEY, …).\n\nRun `{CLI_BIN} --help` for usage."
+    )
+    .into())
+}
+
+fn load_dotenv_best_effort() {
+    if let Ok(dir) = env::current_dir() {
+        let mut current = Some(dir.as_path());
+        while let Some(p) = current {
+            let candidate = p.join(".env");
+            if candidate.is_file() {
+                let _ = dotenvy::from_path(candidate);
+                return;
+            }
+            current = p.parent();
+        }
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(repo_root) = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    {
+        let candidate = repo_root.join(".env");
+        if candidate.is_file() {
+            let _ = dotenvy::from_path(candidate);
+        }
+    }
+}
+
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = default_model_from_env();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
     let mut rest = Vec::new();
+    let mut use_tui_explicit = false;
+    let mut use_line_repl = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -267,7 +375,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "-p" => {
-                // Claw Code compat: -p "prompt" = one-shot prompt
+                // Scream Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
                 if prompt.trim().is_empty() {
                     return Err("-p requires a prompt string".to_string());
@@ -282,8 +390,16 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 });
             }
             "--print" => {
-                // Claw Code compat: --print makes output non-interactive
+                // Scream Code compat: --print makes output non-interactive
                 output_format = CliOutputFormat::Text;
+                index += 1;
+            }
+            "--tui" => {
+                use_tui_explicit = true;
+                index += 1;
+            }
+            "--line-repl" | "--classic-repl" => {
+                use_line_repl = true;
                 index += 1;
             }
             "--resume" if rest.is_empty() => {
@@ -332,17 +448,18 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+        let tui = use_tui_explicit || !use_line_repl;
         return Ok(CliAction::Repl {
             model,
             allowed_tools,
             permission_mode,
+            tui,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
         return parse_resume_args(&rest[1..]);
     }
-    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override)
-    {
+    if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override) {
         return action;
     }
 
@@ -430,11 +547,11 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         .find(|spec| spec.name == command_name)?;
     let guidance = if slash_command.resume_supported {
         format!(
-            "`claw {command_name}` is a slash command. Use `claw --resume SESSION.jsonl /{command_name}` or start `claw` and run `/{command_name}`."
+            "`/{command_name}` is a slash command. Use `{CLI_BIN} --resume SESSION.jsonl /{command_name}` or start `{CLI_BIN}` and run `/{command_name}`."
         )
     } else {
         format!(
-            "`claw {command_name}` is a slash command. Start `claw` and run `/{command_name}` inside the REPL."
+            "`/{command_name}` is a slash command. Start `{CLI_BIN}` and run `/{command_name}` inside the REPL."
         )
     };
     Some(guidance)
@@ -464,7 +581,7 @@ fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
         Ok(Some(command)) => Err({
             let _ = command;
             format!(
-                "slash command {command_name} is interactive-only. Start `claw` and run it there, or use `claw --resume SESSION.jsonl {command_name}` / `claw --resume {latest} {command_name}` when the command is marked [resume] in /help.",
+                "slash command {command_name} is interactive-only. Start `{CLI_BIN}` and run it there, or use `{CLI_BIN} --resume SESSION.jsonl {command_name}` / `{CLI_BIN} --resume {latest} {command_name}` when the command is marked [resume] in /help.",
                 command_name = rest[0],
                 latest = LATEST_SESSION_REFERENCE,
             )
@@ -481,7 +598,7 @@ fn format_unknown_option(option: &str) -> String {
         message.push_str(suggestion);
         message.push('?');
     }
-    message.push_str("\nRun `claw --help` for usage.");
+    message.push_str(&format!("\nRun `{CLI_BIN} --help` for usage."));
     message
 }
 
@@ -492,7 +609,9 @@ fn format_unknown_direct_slash_command(name: &str) -> String {
         message.push('\n');
         message.push_str(&suggestions);
     }
-    message.push_str("\nRun `claw --help` for CLI usage, or start `claw` and use /help.");
+    message.push_str(&format!(
+        "\nRun `{CLI_BIN} --help` for CLI usage, or start `{CLI_BIN}` and use /help."
+    ));
     message
 }
 
@@ -815,7 +934,7 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
         OAuthAuthorizationRequest::from_config(oauth, redirect_uri.clone(), state.clone(), &pkce)
             .build_url();
 
-    println!("Starting Claude OAuth login...");
+    println!("Starting Scream Code OAuth login (Anthropic)...");
     println!("Listening for callback on {redirect_uri}");
     if let Err(error) = open_browser(&authorize_url) {
         eprintln!("warning: failed to open browser automatically: {error}");
@@ -850,13 +969,13 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
         expires_at: token_set.expires_at,
         scopes: token_set.scopes,
     })?;
-    println!("Claude OAuth login complete.");
+    println!("Scream Code OAuth login complete.");
     Ok(())
 }
 
 fn run_logout() -> Result<(), Box<dyn std::error::Error>> {
     clear_oauth_credentials()?;
-    println!("Claude OAuth credentials cleared.");
+    println!("Scream Code OAuth credentials cleared.");
     Ok(())
 }
 
@@ -901,9 +1020,9 @@ fn wait_for_oauth_callback(
     let callback = parse_oauth_callback_request_target(target)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let body = if callback.error.is_some() {
-        "Claude OAuth login failed. You can close this window."
+        "Scream Code OAuth login failed. You can close this window."
     } else {
-        "Claude OAuth login succeeded. You can close this window."
+        "Scream Code OAuth login succeeded. You can close this window."
     };
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -1362,7 +1481,7 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: cleared,
                 message: Some(format!(
-                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  claw --resume {}\n  New session      {new_session_id}\n  Session file     {}",
+                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  {CLI_BIN} --resume {}\n  New session      {new_session_id}\n  Session file     {}",
                     backup_path.display(),
                     backup_path.display(),
                     session_path.display()
@@ -1520,7 +1639,10 @@ fn run_resume_command(
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
-        | SlashCommand::AddDir { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::AddDir { .. }
+        | SlashCommand::Team
+        | SlashCommand::Memo { .. }
+        | SlashCommand::Stop => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -1594,6 +1716,8 @@ struct LiveCli {
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     system_prompt: Vec<String>,
+    /// When true, extra system instructions encourage Planner→Coder→Reviewer style replies (TUI status: 群狼模式).
+    team_mode: bool,
     runtime: BuiltRuntime,
     session: SessionHandle,
 }
@@ -1613,7 +1737,7 @@ struct RuntimeMcpState {
 }
 
 struct BuiltRuntime {
-    runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
+    runtime: Option<ConversationRuntime<LlmRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -1622,7 +1746,7 @@ struct BuiltRuntime {
 
 impl BuiltRuntime {
     fn new(
-        runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+        runtime: ConversationRuntime<LlmRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
@@ -1667,7 +1791,7 @@ impl BuiltRuntime {
 }
 
 impl Deref for BuiltRuntime {
-    type Target = ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>;
+    type Target = ConversationRuntime<LlmRuntimeClient, CliToolExecutor>;
 
     fn deref(&self) -> &Self::Target {
         self.runtime
@@ -1751,37 +1875,38 @@ impl RuntimeMcpState {
             .into_iter()
             .filter(|server_name| !failed_server_names.contains(server_name))
             .collect::<Vec<_>>();
-        let failed_servers = discovery
-            .failed_servers
-            .iter()
-            .map(|failure| runtime::McpFailedServer {
-                server_name: failure.server_name.clone(),
-                phase: runtime::McpLifecyclePhase::ToolDiscovery,
-                error: runtime::McpErrorSurface::new(
-                    runtime::McpLifecyclePhase::ToolDiscovery,
-                    Some(failure.server_name.clone()),
-                    failure.error.clone(),
-                    std::collections::BTreeMap::new(),
-                    true,
-                ),
-            })
-            .chain(discovery.unsupported_servers.iter().map(|server| {
-                runtime::McpFailedServer {
-                    server_name: server.server_name.clone(),
-                    phase: runtime::McpLifecyclePhase::ServerRegistration,
+        let failed_servers =
+            discovery
+                .failed_servers
+                .iter()
+                .map(|failure| runtime::McpFailedServer {
+                    server_name: failure.server_name.clone(),
+                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
                     error: runtime::McpErrorSurface::new(
-                        runtime::McpLifecyclePhase::ServerRegistration,
-                        Some(server.server_name.clone()),
-                        server.reason.clone(),
-                        std::collections::BTreeMap::from([(
-                            "transport".to_string(),
-                            format!("{:?}", server.transport).to_ascii_lowercase(),
-                        )]),
-                        false,
+                        runtime::McpLifecyclePhase::ToolDiscovery,
+                        Some(failure.server_name.clone()),
+                        failure.error.clone(),
+                        std::collections::BTreeMap::new(),
+                        true,
                     ),
-                }
-            }))
-            .collect::<Vec<_>>();
+                })
+                .chain(discovery.unsupported_servers.iter().map(|server| {
+                    runtime::McpFailedServer {
+                        server_name: server.server_name.clone(),
+                        phase: runtime::McpLifecyclePhase::ServerRegistration,
+                        error: runtime::McpErrorSurface::new(
+                            runtime::McpLifecyclePhase::ServerRegistration,
+                            Some(server.server_name.clone()),
+                            server.reason.clone(),
+                            std::collections::BTreeMap::from([(
+                                "transport".to_string(),
+                                format!("{:?}", server.transport).to_ascii_lowercase(),
+                            )]),
+                            false,
+                        ),
+                    }
+                }))
+                .collect::<Vec<_>>();
         let degraded_report = (!failed_servers.is_empty()).then(|| {
             runtime::McpDegradedReport::new(
                 working_servers,
@@ -2100,6 +2225,7 @@ impl LiveCli {
             allowed_tools,
             permission_mode,
             system_prompt,
+            team_mode: false,
             runtime,
             session,
         };
@@ -2126,13 +2252,7 @@ impl LiveCli {
             |path| path.display().to_string(),
         );
         format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+            "\x1b[1;38;5;45mScream\x1b[0m \x1b[1;38;5;201mCode\x1b[0m — full-screen TUI (run `{CLI_BIN}`; use `{CLI_BIN} --line-repl` for classic line mode)\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
@@ -2167,7 +2287,9 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        let for_runtime = hook_abort_signal.clone();
+        let for_client = hook_abort_signal.clone();
+        let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -2178,7 +2300,34 @@ impl LiveCli {
             self.permission_mode,
             None,
         )?
-        .with_hook_abort_signal(hook_abort_signal.clone());
+        .with_hook_abort_signal(for_runtime);
+        runtime.api_client_mut().set_turn_abort(Some(for_client));
+        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
+
+        Ok((runtime, hook_abort_monitor))
+    }
+
+    /// Same as [`Self::prepare_turn_runtime`], but uses an existing abort handle (e.g. TUI `/stop`).
+    fn prepare_turn_runtime_with_external_abort(
+        &self,
+        emit_output: bool,
+        hook_abort_signal: runtime::HookAbortSignal,
+    ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
+        let for_runtime = hook_abort_signal.clone();
+        let for_client = hook_abort_signal.clone();
+        let mut runtime = build_runtime(
+            self.runtime.session().clone(),
+            &self.session.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            emit_output,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?
+        .with_hook_abort_signal(for_runtime);
+        runtime.api_client_mut().set_turn_abort(Some(for_client));
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))
@@ -2227,6 +2376,38 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                Err(Box::new(error))
+            }
+        }
+    }
+
+    /// Run a model turn without streaming markdown/tool traces to stdout (for full-screen TUI).
+    fn run_turn_silent(
+        &mut self,
+        input: &str,
+        stream_tx: Option<std::sync::mpsc::Sender<runtime::AssistantEvent>>,
+        turn_abort: Option<runtime::HookAbortSignal>,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = match turn_abort {
+            Some(signal) => self.prepare_turn_runtime_with_external_abort(false, signal)?,
+            None => self.prepare_turn_runtime(false)?,
+        };
+        if let Some(tx) = stream_tx.as_ref() {
+            runtime.api_client_mut().set_stream_sink(Some(tx.clone()));
+        }
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        hook_abort_monitor.stop();
+        runtime.api_client_mut().set_stream_sink(None);
+        runtime.api_client_mut().set_turn_abort(None);
+        match result {
+            Ok(summary) => {
+                self.replace_runtime(runtime)?;
+                self.persist_session()?;
+                Ok(summary)
+            }
+            Err(error) => {
+                runtime.shutdown_plugins()?;
                 Err(Box::new(error))
             }
         }
@@ -2334,6 +2515,22 @@ impl LiveCli {
             SlashCommand::Model { model } => self.set_model(model)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
+            SlashCommand::Team => {
+                let message = self.toggle_team_mode()?;
+                println!("{message}");
+                false
+            }
+            SlashCommand::Memo { text } => {
+                let message = self.run_memo_command(text)?;
+                println!("{message}");
+                false
+            }
+            SlashCommand::Stop => {
+                eprintln!(
+                    "Line REPL: press Ctrl+C to interrupt the in-flight turn, or use full-screen TUI `/stop`."
+                );
+                false
+            }
             SlashCommand::Cost => {
                 self.print_cost();
                 false
@@ -2577,6 +2774,9 @@ impl LiveCli {
             return Ok(false);
         }
 
+        self.team_mode = false;
+        self.system_prompt = build_system_prompt()?;
+
         let previous_session = self.session.clone();
         let session_state = Session::new();
         self.session = create_managed_session_handle(&session_state.session_id)?;
@@ -2602,6 +2802,66 @@ impl LiveCli {
             self.session.path.display(),
         );
         Ok(true)
+    }
+
+    fn toggle_team_mode(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        const TEAM_MODE_MARKER: &str = "<<SCREAM_TEAM_MODE>>";
+        const TEAM_MODE_HINT: &str = "<<SCREAM_TEAM_MODE>>\nYou are in multi-agent pack collaboration mode. For substantive tasks, briefly structure your reasoning as: Planner (outline) → Coder (implementation) → Reviewer (checks) → Final consolidated answer. Stay concise unless the user asks for depth.";
+
+        self.team_mode = !self.team_mode;
+        if self.team_mode {
+            if !self
+                .system_prompt
+                .iter()
+                .any(|line| line.contains(TEAM_MODE_MARKER))
+            {
+                self.system_prompt.push(TEAM_MODE_HINT.to_string());
+            }
+        } else {
+            self.system_prompt
+                .retain(|line| !line.contains(TEAM_MODE_MARKER));
+        }
+
+        let session = self.runtime.session().clone();
+        let runtime = build_runtime(
+            session,
+            &self.session.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?;
+        self.replace_runtime(runtime)?;
+
+        Ok(if self.team_mode {
+            "已开启群狼（多代理编排）模式。".to_string()
+        } else {
+            "已关闭群狼模式，回到常规对话。".to_string()
+        })
+    }
+
+    fn run_memo_command(
+        &mut self,
+        text: Option<String>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(raw) = text.filter(|s| !s.trim().is_empty()) {
+            return Ok(append_long_term_memory_block_rust(raw.trim(), "/memo"));
+        }
+
+        let excerpt = memo_session_blob_for_extraction(self.runtime.session());
+        let body = memo_completion_extract_markdown_sync(&self.session.id, &self.model, &excerpt)?;
+        if body.is_empty() {
+            return Ok("模型未返回可写入的摘要；本轮未修改记忆文件。".to_string());
+        }
+        Ok(append_long_term_memory_block_rust(&body, "/memo"))
+    }
+
+    #[must_use]
+    fn team_mode(&self) -> bool {
+        self.team_mode
     }
 
     fn print_cost(&self) {
@@ -3073,7 +3333,7 @@ fn format_missing_session_reference(reference: &str) -> String {
 
 fn format_no_managed_sessions() -> String {
     format!(
-        "no managed sessions found in .claw/sessions/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
+        "no managed sessions found in .claw/sessions/\nStart `{CLI_BIN}` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
     )
 }
 
@@ -3811,7 +4071,7 @@ fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Scream Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
     )
 }
 
@@ -3846,6 +4106,133 @@ fn render_export_text(session: &Session) -> String {
         lines.push(String::new());
     }
     lines.join("\n")
+}
+
+fn project_memory_workspace_root() -> PathBuf {
+    if let Ok(raw) = env::var("SCREAM_WORKSPACE_ROOT") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    env::current_dir().unwrap_or_default()
+}
+
+fn long_term_memory_target_path() -> PathBuf {
+    let base = project_memory_workspace_root();
+    let scream = base.join("SCREAM.md");
+    let claude = base.join("CLAUDE.md");
+    if scream.is_file() {
+        scream
+    } else if claude.is_file() {
+        claude
+    } else {
+        scream
+    }
+}
+
+const LONG_TERM_MEMORY_SECTION_HEADING: &str = "## 长效记忆库 · 尖叫 REPL";
+
+fn append_long_term_memory_block_rust(body: &str, source_tag: &str) -> String {
+    let raw = body.trim();
+    if raw.is_empty() {
+        return "无内容可写入。".to_string();
+    }
+    let path = long_term_memory_target_path();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let block = format!(
+        "\n\n---\n\n{}（`{source_tag}` · ts {stamp}）\n\n{raw}\n",
+        LONG_TERM_MEMORY_SECTION_HEADING
+    );
+    let existing = if path.is_file() {
+        match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => return format!("读取现有文件失败: {error}"),
+        }
+    } else {
+        String::new()
+    };
+    let sep = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n\n"
+    };
+    let new_text = if existing.is_empty() {
+        block.trim_start().to_string()
+    } else {
+        format!("{existing}{sep}{}", block.trim_start())
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            return format!("创建目录失败: {error}");
+        }
+    }
+    match fs::write(&path, new_text) {
+        Ok(()) => format!("已安全追加至 {}。", path.display()),
+        Err(error) => format!("写入失败: {error}"),
+    }
+}
+
+fn memo_session_blob_for_extraction(session: &Session) -> String {
+    const MAX_CHARS: usize = 48_000;
+    let blob = render_export_text(session);
+    truncate_for_prompt(blob.trim(), MAX_CHARS)
+}
+
+async fn memo_completion_extract_markdown(
+    client: &ProviderClient,
+    model: &str,
+    excerpt: &str,
+) -> Result<String, ApiError> {
+    const MEMO_EXTRACT_SYSTEM: &str = r#"你是「长效记忆库」整理助手。下面是一段 REPL 对话摘录（仅作依据，勿外传语气）。
+请只输出 Markdown（可用 `###` 小标题与 `-` 列表），归纳：
+1. 用户的技术偏好（语言、框架、工具、代码风格）
+2. 已确定的架构或设计决策
+3. 关键项目背景与约束
+
+要求：不要寒暄；不要重复摘录全文；禁止臆造摘录中不存在的内容；每条尽量具体可执行。
+若几乎无可保存信息，只输出一行：（本轮无可提取的长效要点）"#;
+
+    let user_body = if excerpt.trim().is_empty() {
+        "请根据以下会话摘录提取长效记忆要点（仅 Markdown 输出）：\n\n（无摘录）".to_string()
+    } else {
+        format!("请根据以下会话摘录提取长效记忆要点（仅 Markdown 输出）：\n\n{excerpt}")
+    };
+    let request = MessageRequest {
+        model: model.to_string(),
+        max_tokens: 4096.min(max_tokens_for_model(model)),
+        messages: vec![InputMessage::user_text(user_body)],
+        system: Some(MEMO_EXTRACT_SYSTEM.to_string()),
+        tools: None,
+        tool_choice: None,
+        stream: true,
+    };
+    let mut stream = client.stream_message(&request).await?;
+    let mut text = String::new();
+    while let Some(ev) = stream.next_event().await? {
+        if let ApiStreamEvent::ContentBlockDelta(delta) = ev {
+            if let ContentBlockDelta::TextDelta { text: t } = delta.delta {
+                text.push_str(&t);
+            }
+        }
+    }
+    Ok(text.trim().to_string())
+}
+
+fn memo_completion_extract_markdown_sync(
+    session_id: &str,
+    model: &str,
+    excerpt: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let client = build_provider_client(session_id, model)?;
+    let model = model.to_string();
+    let excerpt = excerpt.to_string();
+    rt.block_on(memo_completion_extract_markdown(&client, &model, &excerpt))
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })
 }
 
 fn default_export_filename(session: &Session) -> String {
@@ -4367,7 +4754,7 @@ fn build_runtime_with_plugin_state(
         .map_err(std::io::Error::other)?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
+        LlmRuntimeClient::new(
             session_id,
             model,
             enable_tools,
@@ -4474,18 +4861,101 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-struct AnthropicRuntimeClient {
+fn build_provider_client(session_id: &str, model: &str) -> Result<ProviderClient, ApiError> {
+    let requested = api::resolve_model_alias(model);
+    if let Some(prof) = llm_config::try_resolve_active_profile() {
+        let profile_model = api::resolve_model_alias(&prof.model_name);
+        if requested == profile_model {
+            let with_cache = |c: ProviderClient| c.with_prompt_cache(PromptCache::new(session_id));
+            return match prof.api_protocol.as_str() {
+                "anthropic" => Ok(with_cache(ProviderClient::Anthropic(
+                    AnthropicClient::from_auth(AuthSource::ApiKey(prof.api_key))
+                        .with_base_url(prof.base_url),
+                ))),
+                _ => Ok(with_cache(ProviderClient::OpenAi(
+                    OpenAiCompatClient::new(prof.api_key, OpenAiCompatConfig::openai())
+                        .with_base_url(prof.base_url),
+                ))),
+            };
+        }
+    }
+    let anthropic_auth = match api::detect_provider_kind(&requested) {
+        ProviderKind::Anthropic => {
+            Some(resolve_anthropic_stack_auth().map_err(|e| ApiError::Auth(e.to_string()))?)
+        }
+        ProviderKind::OpenAi | ProviderKind::Xai => None,
+    };
+    let client = match ProviderClient::from_model_with_anthropic_auth(model, anthropic_auth)? {
+        ProviderClient::Anthropic(c) => {
+            ProviderClient::Anthropic(c.with_base_url(api::read_base_url()))
+        }
+        other => other,
+    };
+    Ok(client.with_prompt_cache(PromptCache::new(session_id)))
+}
+
+/// Auth for Anthropic-shaped APIs only. Do not reuse `OPENAI_API_KEY` here — OpenAI routes use [`ProviderKind::OpenAi`].
+fn resolve_anthropic_stack_auth() -> Result<AuthSource, Box<dyn std::error::Error>> {
+    match resolve_startup_auth_source(|| {
+        let cwd = env::current_dir().map_err(ApiError::from)?;
+        let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
+            ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
+        })?;
+        Ok(config.oauth().cloned())
+    }) {
+        Ok(auth) => Ok(auth),
+        Err(ApiError::MissingCredentials { .. }) => {
+            for key in [
+                "API_KEY",
+                "DEEPSEEK_API_KEY",
+                "DASHSCOPE_API_KEY",
+                "MOONSHOT_API_KEY",
+                "MINIMAX_API_KEY",
+                "MINIMAX_2_API_KEY",
+            ] {
+                if let Ok(v) = env::var(key) {
+                    let v = v.trim().to_string();
+                    if !v.is_empty() {
+                        return Ok(AuthSource::ApiKey(v));
+                    }
+                }
+            }
+            Err(Box::new(ApiError::missing_credentials(
+                "LLM",
+                &[
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "OPENAI_API_KEY",
+                    "XAI_API_KEY",
+                    "API_KEY",
+                    "BASE_URL",
+                    "DEEPSEEK_API_KEY",
+                    "DASHSCOPE_API_KEY",
+                    "MOONSHOT_API_KEY",
+                    "MINIMAX_API_KEY",
+                ],
+            )))
+        }
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+struct LlmRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    /// When set, each streamed [`AssistantEvent`] is also sent here (e.g. for the full-screen TUI).
+    stream_sink: Option<std::sync::mpsc::Sender<runtime::AssistantEvent>>,
+    /// Shared with [`runtime::HookAbortSignal`] on the conversation runtime (TUI `/stop`, Ctrl+C monitor).
+    turn_abort: Option<runtime::HookAbortSignal>,
 }
 
-impl AnthropicRuntimeClient {
+impl LlmRuntimeClient {
     fn new(
         session_id: &str,
         model: String,
@@ -4497,32 +4967,32 @@ impl AnthropicRuntimeClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client: build_provider_client(session_id, &model)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
             model,
             enable_tools,
             emit_output,
             allowed_tools,
             tool_registry,
             progress_reporter,
+            stream_sink: None,
+            turn_abort: None,
         })
+    }
+
+    fn set_stream_sink(&mut self, sink: Option<std::sync::mpsc::Sender<runtime::AssistantEvent>>) {
+        self.stream_sink = sink;
+    }
+
+    fn set_turn_abort(&mut self, signal: Option<runtime::HookAbortSignal>) {
+        self.turn_abort = signal;
     }
 }
 
-fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_startup_auth_source(|| {
-        let cwd = env::current_dir().map_err(api::ApiError::from)?;
-        let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
-            api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
-        })?;
-        Ok(config.oauth().cloned())
-    })?)
-}
-
-impl ApiClient for AnthropicRuntimeClient {
+impl ApiClient for LlmRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let stream_tx = self.stream_sink.clone();
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
@@ -4556,16 +5026,33 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
+            let stream_hook = stream_tx.as_ref();
 
             while let Some(event) = stream
                 .next_event()
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?
             {
+                if self
+                    .turn_abort
+                    .as_ref()
+                    .is_some_and(runtime::HookAbortSignal::is_aborted)
+                {
+                    return Err(RuntimeError::new(
+                        "user interrupted the model stream (/stop or cooperative abort)",
+                    ));
+                }
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(block, out, &mut events, &mut pending_tool, true)?;
+                            push_output_block(
+                                block,
+                                out,
+                                &mut events,
+                                &mut pending_tool,
+                                true,
+                                stream_hook,
+                            )?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
@@ -4575,6 +5062,7 @@ impl ApiClient for AnthropicRuntimeClient {
                             &mut events,
                             &mut pending_tool,
                             true,
+                            stream_hook,
                         )?;
                     }
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -4588,7 +5076,11 @@ impl ApiClient for AnthropicRuntimeClient {
                                         .and_then(|()| out.flush())
                                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                                 }
-                                events.push(AssistantEvent::TextDelta(text));
+                                let ev = AssistantEvent::TextDelta(text);
+                                events.push(ev.clone());
+                                if let Some(tx) = stream_hook {
+                                    let _ = tx.send(ev);
+                                }
                             }
                         }
                         ContentBlockDelta::InputJsonDelta { partial_json } => {
@@ -4613,11 +5105,20 @@ impl ApiClient for AnthropicRuntimeClient {
                             writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            events.push(AssistantEvent::ToolUse { id, name, input });
+                            let ev = AssistantEvent::ToolUse { id, name, input };
+                            events.push(ev.clone());
+                            if let Some(tx) = stream_hook {
+                                let _ = tx.send(ev);
+                            }
                         }
                     }
                     ApiStreamEvent::MessageDelta(delta) => {
-                        events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                        let u = delta.usage.token_usage();
+                        let ev = AssistantEvent::Usage(u);
+                        events.push(ev.clone());
+                        if let Some(tx) = stream_hook {
+                            let _ = tx.send(ev);
+                        }
                     }
                     ApiStreamEvent::MessageStop(_) => {
                         saw_stop = true;
@@ -4627,11 +5128,20 @@ impl ApiClient for AnthropicRuntimeClient {
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
                         }
                         events.push(AssistantEvent::MessageStop);
+                        if let Some(tx) = stream_hook {
+                            let _ = tx.send(AssistantEvent::MessageStop);
+                        }
                     }
                 }
             }
 
+            let len_before_cache = events.len();
             push_prompt_cache_record(&self.client, &mut events);
+            if let Some(tx) = stream_hook {
+                for ev in events[len_before_cache..].iter().cloned() {
+                    let _ = tx.send(ev);
+                }
+            }
 
             if !saw_stop
                 && events.iter().any(|event| {
@@ -4640,6 +5150,9 @@ impl ApiClient for AnthropicRuntimeClient {
                 })
             {
                 events.push(AssistantEvent::MessageStop);
+                if let Some(tx) = stream_hook {
+                    let _ = tx.send(AssistantEvent::MessageStop);
+                }
             }
 
             if events
@@ -4657,8 +5170,14 @@ impl ApiClient for AnthropicRuntimeClient {
                 })
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let mut events = response_to_events(response, out)?;
+            let mut events = response_to_events(response, out, stream_hook)?;
+            let len_before_cache = events.len();
             push_prompt_cache_record(&self.client, &mut events);
+            if let Some(tx) = stream_hook {
+                for ev in events[len_before_cache..].iter().cloned() {
+                    let _ = tx.send(ev);
+                }
+            }
             Ok(events)
         })
     }
@@ -4753,6 +5272,9 @@ fn slash_command_completion_candidates_with_sessions(
     for candidate in [
         "/bughunter ",
         "/clear --confirm",
+        "/team",
+        "/stop",
+        "/memo ",
         "/config ",
         "/config env",
         "/config hooks",
@@ -5253,6 +5775,7 @@ fn push_output_block(
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
+    stream_tx: Option<&std::sync::mpsc::Sender<AssistantEvent>>,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
@@ -5261,7 +5784,11 @@ fn push_output_block(
                 write!(out, "{rendered}")
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                events.push(AssistantEvent::TextDelta(text));
+                let ev = AssistantEvent::TextDelta(text);
+                events.push(ev.clone());
+                if let Some(tx) = stream_tx {
+                    let _ = tx.send(ev);
+                }
             }
         }
         OutputContentBlock::ToolUse { id, name, input } => {
@@ -5286,26 +5813,40 @@ fn push_output_block(
 fn response_to_events(
     response: MessageResponse,
     out: &mut (impl Write + ?Sized),
+    stream_tx: Option<&std::sync::mpsc::Sender<AssistantEvent>>,
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
 
     for block in response.content {
-        push_output_block(block, out, &mut events, &mut pending_tool, false)?;
+        push_output_block(block, out, &mut events, &mut pending_tool, false, stream_tx)?;
         if let Some((id, name, input)) = pending_tool.take() {
-            events.push(AssistantEvent::ToolUse { id, name, input });
+            let ev = AssistantEvent::ToolUse { id, name, input };
+            events.push(ev.clone());
+            if let Some(tx) = stream_tx {
+                let _ = tx.send(ev);
+            }
         }
     }
 
-    events.push(AssistantEvent::Usage(response.usage.token_usage()));
+    let usage = response.usage.token_usage();
+    events.push(AssistantEvent::Usage(usage));
+    if let Some(tx) = stream_tx {
+        let _ = tx.send(AssistantEvent::Usage(usage));
+    }
     events.push(AssistantEvent::MessageStop);
+    if let Some(tx) = stream_tx {
+        let _ = tx.send(AssistantEvent::MessageStop);
+    }
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
-    if let Some(record) = client.take_last_prompt_cache_record() {
-        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
-            events.push(AssistantEvent::PromptCache(event));
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
+    if let ProviderClient::Anthropic(c) = client {
+        if let Some(record) = c.take_last_prompt_cache_record() {
+            if let Some(event) = prompt_cache_record_to_runtime_event(record) {
+                events.push(AssistantEvent::PromptCache(event));
+            }
         }
     }
 }
@@ -5512,52 +6053,58 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 
 #[allow(clippy::too_many_lines)]
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
-    writeln!(out, "claw v{VERSION}")?;
+    writeln!(out, "{CLI_BIN} v{VERSION}")?;
     writeln!(out)?;
     writeln!(out, "Usage:")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+        "  {CLI_BIN} [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
-    writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
+        "      Start Scream Code (full-screen TUI by default; --line-repl for classic REPL)"
+    )?;
+    writeln!(
+        out,
+        "  {CLI_BIN} [--model MODEL] [--output-format text|json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] TEXT"
+        "  {CLI_BIN} [--model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
         out,
-        "  claw --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
+        "  {CLI_BIN} --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
     )?;
     writeln!(
         out,
         "      Inspect or maintain a saved session without entering the REPL"
     )?;
-    writeln!(out, "  claw help")?;
+    writeln!(out, "  {CLI_BIN} help")?;
     writeln!(out, "      Alias for --help")?;
-    writeln!(out, "  claw version")?;
+    writeln!(out, "  {CLI_BIN} version")?;
     writeln!(out, "      Alias for --version")?;
-    writeln!(out, "  claw status")?;
+    writeln!(out, "  {CLI_BIN} status")?;
     writeln!(
         out,
         "      Show the current local workspace status snapshot"
     )?;
-    writeln!(out, "  claw sandbox")?;
+    writeln!(out, "  {CLI_BIN} sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
-    writeln!(out, "  claw dump-manifests")?;
-    writeln!(out, "  claw bootstrap-plan")?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw mcp")?;
-    writeln!(out, "  claw skills")?;
-    writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
-    writeln!(out, "  claw login")?;
-    writeln!(out, "  claw logout")?;
-    writeln!(out, "  claw init")?;
+    writeln!(out, "  {CLI_BIN} dump-manifests")?;
+    writeln!(out, "  {CLI_BIN} bootstrap-plan")?;
+    writeln!(out, "  {CLI_BIN} agents")?;
+    writeln!(out, "  {CLI_BIN} mcp")?;
+    writeln!(out, "  {CLI_BIN} skills")?;
+    writeln!(
+        out,
+        "  {CLI_BIN} system-prompt [--cwd PATH] [--date YYYY-MM-DD]"
+    )?;
+    writeln!(out, "  {CLI_BIN} login")?;
+    writeln!(out, "  {CLI_BIN} logout")?;
+    writeln!(out, "  {CLI_BIN} init")?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
     writeln!(
@@ -5575,6 +6122,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --dangerously-skip-permissions  Skip all permission checks"
+    )?;
+    writeln!(
+        out,
+        "  --tui                      Force full-screen Scream Code TUI (default when no subcommand)"
+    )?;
+    writeln!(
+        out,
+        "  --line-repl, --classic-repl  Classic line-based REPL instead of full-screen TUI"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
@@ -5609,25 +6164,28 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(out, "  claw --model claude-opus \"summarize this repo\"")?;
     writeln!(
         out,
-        "  claw --output-format json prompt \"explain src/main.rs\""
+        "  {CLI_BIN} --model claude-sonnet-4-6 \"summarize this repo\""
     )?;
     writeln!(
         out,
-        "  claw --allowedTools read,glob \"summarize Cargo.toml\""
+        "  {CLI_BIN} --output-format json prompt \"explain src/main.rs\""
     )?;
-    writeln!(out, "  claw --resume {LATEST_SESSION_REFERENCE}")?;
     writeln!(
         out,
-        "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
+        "  {CLI_BIN} --allowedTools read,glob \"summarize Cargo.toml\""
     )?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw mcp show my-server")?;
-    writeln!(out, "  claw /skills")?;
-    writeln!(out, "  claw login")?;
-    writeln!(out, "  claw init")?;
+    writeln!(out, "  {CLI_BIN} --resume {LATEST_SESSION_REFERENCE}")?;
+    writeln!(
+        out,
+        "  {CLI_BIN} --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
+    )?;
+    writeln!(out, "  {CLI_BIN} agents")?;
+    writeln!(out, "  {CLI_BIN} mcp show my-server")?;
+    writeln!(out, "  {CLI_BIN} /skills")?;
+    writeln!(out, "  {CLI_BIN} login")?;
+    writeln!(out, "  {CLI_BIN} init")?;
     Ok(())
 }
 
@@ -5702,7 +6260,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}"))
+        std::env::temp_dir().join(format!("scream-cli-{nanos}"))
     }
 
     fn git(args: &[&str], cwd: &Path) {
@@ -5791,6 +6349,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                tui: true,
             }
         );
     }
@@ -5958,6 +6517,38 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+                tui: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_tui_flag_for_repl() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--tui".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                tui: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_line_repl_disables_full_screen_tui() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        assert_eq!(
+            parse_args(&["--line-repl".to_string()]).expect("args should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                tui: false,
             }
         );
     }
@@ -5982,6 +6573,7 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
+                tui: true,
             }
         );
     }
@@ -6133,7 +6725,7 @@ mod tests {
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
-        assert!(error.contains("claw --resume SESSION.jsonl /status"));
+        assert!(error.contains("scream --resume SESSION.jsonl /status"));
     }
 
     #[test]
@@ -6223,7 +6815,7 @@ mod tests {
         let error = parse_args(&["--resum".to_string()]).expect_err("unknown option should fail");
         assert!(error.contains("unknown option: --resum"));
         assert!(error.contains("Did you mean --resume?"));
-        assert!(error.contains("claw --help"));
+        assert!(error.contains("scream --help"));
     }
 
     #[test]
@@ -6379,6 +6971,8 @@ mod tests {
             .startup_banner()
         });
 
+        assert!(banner.contains("Scream"));
+        assert!(banner.contains("--line-repl"));
         assert!(banner.contains("Tab"));
         assert!(banner.contains("workflow completions"));
 
@@ -6465,15 +7059,15 @@ mod tests {
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw help"));
-        assert!(help.contains("claw version"));
-        assert!(help.contains("claw status"));
-        assert!(help.contains("claw sandbox"));
-        assert!(help.contains("claw init"));
-        assert!(help.contains("claw agents"));
-        assert!(help.contains("claw mcp"));
-        assert!(help.contains("claw skills"));
-        assert!(help.contains("claw /skills"));
+        assert!(help.contains("scream help"));
+        assert!(help.contains("scream version"));
+        assert!(help.contains("scream status"));
+        assert!(help.contains("scream sandbox"));
+        assert!(help.contains("scream init"));
+        assert!(help.contains("scream agents"));
+        assert!(help.contains("scream mcp"));
+        assert!(help.contains("scream skills"));
+        assert!(help.contains("scream /skills"));
     }
 
     #[test]
@@ -6867,10 +7461,10 @@ UU conflicted.rs",
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
+        assert!(help.contains("scream --resume [SESSION.jsonl|session-id|latest]"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
-        assert!(help.contains("claw --resume latest"));
-        assert!(help.contains("claw --resume latest /status /diff /export notes.txt"));
+        assert!(help.contains("scream --resume latest"));
+        assert!(help.contains("scream --resume latest /status /diff /export notes.txt"));
     }
 
     #[test]
@@ -6970,7 +7564,7 @@ UU conflicted.rs",
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("claw-cli-{label}-{nanos}"))
+        std::env::temp_dir().join(format!("scream-cli-{label}-{nanos}"))
     }
 
     #[test]
@@ -7127,7 +7721,7 @@ UU conflicted.rs",
             task_label: "ship plugin progress".to_string(),
             step: 3,
             phase: "running read_file".to_string(),
-            detail: Some("reading rust/crates/rusty-claude-cli/src/main.rs".to_string()),
+            detail: Some("reading rust/crates/scream-cli/src/main.rs".to_string()),
             saw_final_text: false,
         };
 
@@ -7174,8 +7768,8 @@ UU conflicted.rs",
             "reading src/main.rs"
         );
         assert!(
-            describe_tool_progress("bash", r#"{"command":"cargo test -p rusty-claude-cli"}"#)
-                .contains("cargo test -p rusty-claude-cli")
+            describe_tool_progress("bash", r#"{"command":"cargo test -p scream-cli"}"#)
+                .contains("cargo test -p scream-cli")
         );
         assert_eq!(
             describe_tool_progress("grep_search", r#"{"pattern":"ultraplan","path":"rust"}"#),
@@ -7197,6 +7791,7 @@ UU conflicted.rs",
             &mut events,
             &mut pending_tool,
             false,
+            None,
         )
         .expect("text block should render");
 
@@ -7221,6 +7816,7 @@ UU conflicted.rs",
             &mut events,
             &mut pending_tool,
             true,
+            None,
         )
         .expect("tool block should accumulate");
 
@@ -7256,6 +7852,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            None,
         )
         .expect("response conversion should succeed");
 
@@ -7291,6 +7888,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            None,
         )
         .expect("response conversion should succeed");
 
@@ -7330,6 +7928,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            None,
         )
         .expect("response conversion should succeed");
 
@@ -7509,8 +8108,12 @@ UU conflicted.rs",
         let runtime_config = loader.load().expect("runtime config should load");
         let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
             .expect("runtime plugin state should load");
-        let mut executor =
-            CliToolExecutor::new(None, false, state.tool_registry.clone(), state.mcp_state.clone());
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
 
         let search_output = executor
             .execute("ToolSearch", r#"{"query":"remote","max_results":5}"#)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .commands import built_in_command_names, get_commands
 from . import model_manager
-from .project_memory import project_memory_system_suffix
+from .project_memory import project_memory_system_suffix, project_memory_workspace_root
 from .setup import run_setup
 from .tools import get_tools
 
@@ -56,4 +56,4 @@ def build_system_init_message(trusted: bool = True) -> str:
         '',
         LLM_COT_LANGUAGE_REQUIREMENT,
     ]
-    return '\n'.join(lines) + project_memory_system_suffix()
+    return '\n'.join(lines) + project_memory_system_suffix(project_memory_workspace_root())

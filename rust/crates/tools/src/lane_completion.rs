@@ -16,7 +16,7 @@ use runtime::{
 use crate::AgentOutput;
 
 /// Detects if a lane should be automatically marked as completed.
-/// 
+///
 /// Returns `Some(LaneContext)` with `completed = true` if all conditions met,
 /// `None` if lane should remain active.
 pub(crate) fn detect_lane_completion(
@@ -28,29 +28,29 @@ pub(crate) fn detect_lane_completion(
     if output.error.is_some() {
         return None;
     }
-    
+
     // Must have finished status
     if !output.status.eq_ignore_ascii_case("completed")
         && !output.status.eq_ignore_ascii_case("finished")
     {
         return None;
     }
-    
+
     // Must have no current blocker
     if output.current_blocker.is_some() {
         return None;
     }
-    
+
     // Must have green tests
     if !test_green {
         return None;
     }
-    
+
     // Must have pushed code
     if !has_pushed {
         return None;
     }
-    
+
     // All conditions met — create completed context
     Some(LaneContext {
         lane_id: output.agent_id.clone(),
@@ -65,9 +65,7 @@ pub(crate) fn detect_lane_completion(
 }
 
 /// Evaluates policy actions for a completed lane.
-pub(crate) fn evaluate_completed_lane(
-    context: &LaneContext,
-) -> Vec<PolicyAction> {
+pub(crate) fn evaluate_completed_lane(context: &LaneContext) -> Vec<PolicyAction> {
     let engine = PolicyEngine::new(vec![
         PolicyRule::new(
             "closeout-completed-lane",
@@ -85,7 +83,7 @@ pub(crate) fn evaluate_completed_lane(
             5,
         ),
     ]);
-    
+
     evaluate(&engine, context)
 }
 
@@ -112,53 +110,53 @@ mod tests {
             error: None,
         }
     }
-    
+
     #[test]
     fn detects_completion_when_all_conditions_met() {
         let output = test_output();
         let result = detect_lane_completion(&output, true, true);
-        
+
         assert!(result.is_some());
         let context = result.unwrap();
         assert!(context.completed);
         assert_eq!(context.green_level, 3);
         assert_eq!(context.blocker, LaneBlocker::None);
     }
-    
+
     #[test]
     fn no_completion_when_error_present() {
         let mut output = test_output();
         output.error = Some("Build failed".to_string());
-        
+
         let result = detect_lane_completion(&output, true, true);
         assert!(result.is_none());
     }
-    
+
     #[test]
     fn no_completion_when_not_finished() {
         let mut output = test_output();
         output.status = "Running".to_string();
-        
+
         let result = detect_lane_completion(&output, true, true);
         assert!(result.is_none());
     }
-    
+
     #[test]
     fn no_completion_when_tests_not_green() {
         let output = test_output();
-        
+
         let result = detect_lane_completion(&output, false, true);
         assert!(result.is_none());
     }
-    
+
     #[test]
     fn no_completion_when_not_pushed() {
         let output = test_output();
-        
+
         let result = detect_lane_completion(&output, true, false);
         assert!(result.is_none());
     }
-    
+
     #[test]
     fn evaluate_triggers_closeout_for_completed_lane() {
         let context = LaneContext {
@@ -171,9 +169,9 @@ mod tests {
             completed: true,
             reconciled: false,
         };
-        
+
         let actions = evaluate_completed_lane(&context);
-        
+
         assert!(actions.contains(&PolicyAction::CloseoutLane));
         assert!(actions.contains(&PolicyAction::CleanupSession));
     }

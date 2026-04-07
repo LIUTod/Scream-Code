@@ -115,6 +115,11 @@ def _memo_extract_via_llm(engine: QueryEnginePort, *, excerpt: str) -> tuple[str
 
 
 def _confirm_store_summary(console: Any | None) -> bool:
+    import os
+
+    # Rust TUI 经 JSON stdio 驱动时 stdin 专用于协议行，不能阻塞在 questionary/input。
+    if os.environ.get('SCREAM_REPL_JSON_STDIO', '').strip().lower() in ('1', 'true', 'yes'):
+        return False
     try:
         import questionary
     except ImportError:
@@ -139,11 +144,12 @@ def _print_help(console: Any | None) -> None:
             '时光机与记忆',
             [
                 '/summary — 项目与会话摘要；可确认后写入长效记忆（SCREAM.md / CLAUDE.md）',
-                '/memo — 调用模型从当前会话提取要点并追加到长效记忆文件',
+                '/memo [要点] — 带文字时直接追加到 SCREAM.md；不带参数时用模型从会话提取要点',
                 '/new — 硬重置：清空对话、新 session_id、重置计数与展示层缓存（较 /flush 更彻底）',
                 '/flush — 清空本轮对话、重置 token 累计并落盘新会话',
                 '/sessions — 扫描 .port_sessions 下列出历史会话',
                 '/load <id> — 恢复指定会话 id（原生 load-session）',
+                '/stop — 中断当前轮工具链（长 bash、后续 tool 调用会收到 [User Interrupted Task]）',
             ],
         ),
         (
@@ -541,6 +547,26 @@ def dispatch_repl_slash_command(
         return True, None
 
     if cmd == '/memo':
+        memo_direct = rest.strip()
+        if memo_direct:
+            result = append_long_term_memory_block(memo_direct, source_tag='/memo')
+            if console is not None:
+                from rich.panel import Panel
+                from rich.text import Text
+
+                ok = result.startswith('已安全')
+                st = 'bold green' if ok else 'yellow'
+                br = 'green' if ok else 'yellow'
+                console.print(
+                    Panel(
+                        Text.from_markup(f'[{st}]{result}[/{st}]'),
+                        title='[bold]/memo · 长效记忆[/bold]',
+                        border_style=br,
+                    )
+                )
+            else:
+                print(result)
+            return True, None
         if not engine.config.llm_enabled:
             _msg(console, '/memo 需要已启用大模型的 REPL（勿使用 repl --no-llm）。', style='yellow')
             return True, None
@@ -579,6 +605,17 @@ def dispatch_repl_slash_command(
             _msg(console, f'已清空对话并落盘新会话: {path}', style='bold green')
         except OSError as exc:
             _msg(console, f'flush 失败: {exc}', style='bold red')
+        return True, None
+
+    if cmd == '/stop':
+        from . import agent_cancel
+
+        agent_cancel.request_agent_cancel()
+        _msg(
+            console,
+            '已请求中断当前工具链（bash 子进程将尽快结束；未执行的 tool 将收到 [User Interrupted Task]）。',
+            style='bold yellow',
+        )
         return True, None
 
     if cmd == '/sessions':

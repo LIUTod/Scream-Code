@@ -4,6 +4,7 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
+from src.llm_client import agent_tool_iteration_cap, max_agent_tool_rounds
 from src.port_manifest import build_port_manifest
 from src.query_engine import QueryEngineConfig, QueryEnginePort
 
@@ -28,6 +29,18 @@ def _chunk(
 
 
 class LlmClientTests(unittest.TestCase):
+    def test_agent_tool_iteration_cap_env(self) -> None:
+        with patch.dict(os.environ, {'SCREAM_MAX_AGENT_TOOL_ROUNDS': '99'}, clear=False):
+            self.assertEqual(agent_tool_iteration_cap(), 99)
+            self.assertEqual(max_agent_tool_rounds(), 99)
+        with patch.dict(os.environ, {'SCREAM_MAX_AGENT_TOOL_ROUNDS': '0'}, clear=False):
+            self.assertIsNone(agent_tool_iteration_cap())
+            self.assertEqual(max_agent_tool_rounds(), 10**9)
+        with patch.dict(os.environ, {'SCREAM_MAX_AGENT_TOOL_ROUNDS': 'unlimited'}, clear=False):
+            self.assertIsNone(agent_tool_iteration_cap())
+        with patch.dict(os.environ, {'SCREAM_MAX_AGENT_TOOL_ROUNDS': 'not-int'}, clear=False):
+            self.assertIsNone(agent_tool_iteration_cap())
+
     def test_submit_message_calls_openai_sdk_when_llm_enabled(self) -> None:
         manifest = build_port_manifest()
         fake_stream = iter(

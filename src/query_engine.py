@@ -63,15 +63,33 @@ class QueryEnginePort:
 
     @classmethod
     def from_saved_session(cls, session_id: str) -> 'QueryEnginePort':
+        """
+        从 JSON 恢复 ``mutable_messages``、用量与（若存在）``llm_conversation_messages`` 快照。
+        快照存在时恢复完整多轮 LLM 上下文；仅旧版文件时退化为仅用 ``mutable_messages`` 拼用户历史。
+        恢复后会用当前项目记忆刷新首条 ``system``，避免 SCREAM.md 等更新后不生效。
+        """
         stored = load_session(session_id)
         transcript = TranscriptStore(entries=list(stored.messages), flushed=True)
+        llm_list: list[dict[str, Any]] = []
+        if stored.llm_conversation_messages:
+            llm_list = [copy.deepcopy(m) for m in stored.llm_conversation_messages]
+            from .system_init import build_system_init_message
+
+            sys_msg: dict[str, Any] = {
+                'role': 'system',
+                'content': build_system_init_message(trusted=True),
+            }
+            if llm_list and llm_list[0].get('role') == 'system':
+                llm_list[0] = sys_msg
+            else:
+                llm_list.insert(0, sys_msg)
         return cls(
             manifest=build_port_manifest(),
             session_id=stored.session_id,
             mutable_messages=list(stored.messages),
             total_usage=UsageSummary(stored.input_tokens, stored.output_tokens),
             transcript_store=transcript,
-            llm_conversation_messages=[],
+            llm_conversation_messages=llm_list,
             repl_team_mode=False,
         )
 
@@ -171,6 +189,34 @@ class QueryEnginePort:
             user_lines.extend(f'- {d.tool_name}: {d.reason}' for d in denied_tools)
         return '\n'.join(user_lines)
 
+    def _repl_messages_base_before_current_user(self) -> list[dict[str, Any]]:
+        """
+        构造「当前 user 条」之前的消息前缀。
+
+        - 若已有 ``llm_conversation_messages``（含多轮工具闭环快照），则深拷贝后**重写首条
+          system**，使 ``SCREAM.md`` 等与 :func:`build_system_init_message` 同步注入（不修改
+          磁盘上的会话 JSON，仅影响当次 API 请求）。
+        - 若为空，则用 ``system`` + 逐条历史用户原文补全。
+        """
+        from .system_init import build_system_init_message
+
+        sys_content = build_system_init_message(trusted=True)
+        if self.llm_conversation_messages:
+            out = copy.deepcopy(self.llm_conversation_messages)
+            if out and (out[0].get('role') or '').strip().lower() == 'system':
+                merged = dict(out[0])
+                merged['role'] = 'system'
+                merged['content'] = sys_content
+                out[0] = merged
+            else:
+                out.insert(0, {'role': 'system', 'content': sys_content})
+            return out
+
+        out = [{'role': 'system', 'content': sys_content}]
+        for raw in self.mutable_messages:
+            out.append({'role': 'user', 'content': str(raw)})
+        return out
+
     def _assemble_messages_for_llm_turn(
         self,
         prompt: str,
@@ -181,32 +227,18 @@ class QueryEnginePort:
         """
         组装发往 API 的 messages：首轮含 system（含项目记忆，仅一次）；后续轮在深拷贝历史上追加本轮 user。
         """
-        from .system_init import build_system_init_message
-
         user_msg: dict[str, Any] = {
             'role': 'user',
             'content': self._format_turn_user_content(
                 prompt, matched_commands, matched_tools, denied_tools
             ),
         }
-        if not self.llm_conversation_messages:
-            return [
-                {'role': 'system', 'content': build_system_init_message(trusted=True)},
-                user_msg,
-            ]
-        return copy.deepcopy(self.llm_conversation_messages) + [user_msg]
+        return self._repl_messages_base_before_current_user() + [user_msg]
 
     def _assemble_messages_for_team_phase(self, user_content: str) -> list[dict[str, Any]]:
         """团队编排单阶段：在已有 ``llm_conversation_messages`` 上追加一条 user。"""
-        from .system_init import build_system_init_message
-
         user_msg: dict[str, Any] = {'role': 'user', 'content': user_content}
-        if not self.llm_conversation_messages:
-            return [
-                {'role': 'system', 'content': build_system_init_message(trusted=True)},
-                user_msg,
-            ]
-        return copy.deepcopy(self.llm_conversation_messages) + [user_msg]
+        return self._repl_messages_base_before_current_user() + [user_msg]
 
     def _finalize_llm_assistant_text(
         self,
@@ -321,7 +353,14 @@ class QueryEnginePort:
         messages: list[dict[str, Any]] = self._assemble_messages_for_llm_turn(
             prompt, matched_commands, matched_tools, denied_tools
         )
-        settings = read_llm_connection_settings()
+        try:
+            settings = read_llm_connection_settings()
+        except Exception as exc:
+            yield {
+                'type': 'llm_error',
+                'output': f'[LLM] 无法读取模型连接配置: {exc}',
+            }
+            return
         raw_override = (self.config.llm_model or '').strip()
         model_override = raw_override or None
 
@@ -355,7 +394,7 @@ class QueryEnginePort:
                     else:
                         self.total_usage = self.total_usage.add_turn(prompt, output)
 
-                    stop_reason = 'completed'
+                    stop_reason = str(ev.get('stop_reason') or 'completed')
                     if (
                         self.total_usage.input_tokens + self.total_usage.output_tokens
                         > self.config.max_budget_tokens
@@ -365,7 +404,15 @@ class QueryEnginePort:
                     self.transcript_store.append(prompt)
                     self.permission_denials.extend(denied_tools)
                     self.compact_messages_if_needed()
-                    yield {'type': 'finished', 'output': output, 'stop_reason': stop_reason}
+                    yield {
+                        'type': 'finished',
+                        'output': output,
+                        'stop_reason': stop_reason,
+                        'turn_input_tokens': in_tok,
+                        'turn_output_tokens': out_tok,
+                        'cumulative_input_tokens': self.total_usage.input_tokens,
+                        'cumulative_output_tokens': self.total_usage.output_tokens,
+                    }
                     return
                 if et == 'llm_error':
                     yield ev
@@ -373,6 +420,12 @@ class QueryEnginePort:
                 yield ev
         except GeneratorExit:
             raise
+        except Exception as exc:
+            yield {
+                'type': 'llm_error',
+                'output': f'[LLM] 会话编排异常: {exc}',
+            }
+            return
 
     def iter_team_repl_assistant_events(
         self,
@@ -407,7 +460,14 @@ class QueryEnginePort:
         base_user = self._format_turn_user_content(
             prompt, matched_commands, matched_tools, denied_tools
         )
-        settings = read_llm_connection_settings()
+        try:
+            settings = read_llm_connection_settings()
+        except Exception as exc:
+            yield {
+                'type': 'llm_error',
+                'output': f'[LLM] 无法读取模型连接配置: {exc}',
+            }
+            return
         raw_override = (self.config.llm_model or '').strip()
         model_override = raw_override or None
 
@@ -488,9 +548,23 @@ class QueryEnginePort:
             self.transcript_store.append(prompt)
             self.permission_denials.extend(denied_tools)
             self.compact_messages_if_needed()
-            yield {'type': 'finished', 'output': output, 'stop_reason': stop_reason}
+            yield {
+                'type': 'finished',
+                'output': output,
+                'stop_reason': stop_reason,
+                'turn_input_tokens': phase_in,
+                'turn_output_tokens': phase_out,
+                'cumulative_input_tokens': self.total_usage.input_tokens,
+                'cumulative_output_tokens': self.total_usage.output_tokens,
+            }
         except GeneratorExit:
             raise
+        except Exception as exc:
+            yield {
+                'type': 'llm_error',
+                'output': f'[LLM] 团队编排异常: {exc}',
+            }
+            return
 
     def iter_repl_assistant_events_with_runtime(
         self,
@@ -607,12 +681,16 @@ class QueryEnginePort:
 
     def persist_session(self) -> str:
         self.flush_transcript()
+        conv_tuple: tuple[dict[str, Any], ...] = tuple(
+            copy.deepcopy(m) for m in self.llm_conversation_messages
+        )
         path = save_session(
             StoredSession(
                 session_id=self.session_id,
                 messages=tuple(self.mutable_messages),
                 input_tokens=self.total_usage.input_tokens,
                 output_tokens=self.total_usage.output_tokens,
+                llm_conversation_messages=conv_tuple,
             )
         )
         return str(path)

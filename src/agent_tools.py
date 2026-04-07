@@ -6,6 +6,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 from .llm_settings import project_root
@@ -134,15 +136,69 @@ def execute_mac_bash(command: str) -> str:
         cwd = os.path.expanduser('~')
     else:
         cwd = str(_workspace_root())
-    proc = subprocess.run(
+    env = {
+        **os.environ,
+        'LC_ALL': 'C.UTF-8',
+        'LANG': 'C.UTF-8',
+        'PYTHONIOENCODING': 'utf-8',
+    }
+    proc = subprocess.Popen(
         [str(bash), '-lc', command],
         cwd=cwd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=120,
-        env={**os.environ, 'LC_ALL': 'C.UTF-8'},
+        encoding='utf-8',
+        errors='replace',
+        env=env,
     )
-    out = (proc.stdout or '') + (proc.stderr or '')
+    out_box: list[tuple[str, str] | BaseException] = []
+
+    def _drain() -> None:
+        try:
+            out_box.append(proc.communicate())
+        except Exception as exc:  # pragma: no cover - 极少
+            out_box.append(exc)
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    try:
+        from . import agent_cancel
+
+        deadline = time.monotonic() + 120.0
+        while reader.is_alive():
+            if agent_cancel.agent_cancel_requested():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=4.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=3.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+                reader.join(timeout=8.0)
+                return agent_cancel.INTERRUPT_TOOL_MESSAGE
+            if time.monotonic() > deadline:
+                proc.kill()
+                try:
+                    proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    pass
+                reader.join(timeout=8.0)
+                return '[执行失败] TimeoutExpired: 命令超过 120 秒'
+            time.sleep(0.12)
+        reader.join(timeout=1.0)
+    except OSError as exc:
+        return f'[执行失败] {type(exc).__name__}: {exc}'
+
+    if not out_box:
+        return '[执行失败] 子进程无输出'
+    got = out_box[0]
+    if isinstance(got, BaseException):
+        return f'[执行失败] {type(got).__name__}: {got}'
+    stdout, stderr = got
+    out = (stdout or '') + (stderr or '')
     out = out.strip()
     if len(out) > 32_000:
         out = out[:32_000] + '\n…(输出已截断)…'

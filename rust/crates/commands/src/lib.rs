@@ -100,6 +100,27 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "team",
+        aliases: &[],
+        summary: "Toggle multi-agent (pack) collaboration instructions",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "memo",
+        aliases: &[],
+        summary: "Append long-term memory to SCREAM.md (or extract from session when no text)",
+        argument_hint: Some("[要点]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "stop",
+        aliases: &[],
+        summary: "Interrupt the in-flight model stream and tool hooks for this turn",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "cost",
         aliases: &[],
         summary: "Show cumulative token usage for this session",
@@ -1073,6 +1094,14 @@ pub enum SlashCommand {
     Clear {
         confirm: bool,
     },
+    /// Toggle “pack” / multi-agent style system instructions (Rust TUI + line REPL).
+    Team,
+    /// Append explicit text to long-term memory file, or run a one-shot extraction when `text` is `None`.
+    Memo {
+        text: Option<String>,
+    },
+    /// Request cooperative abort for the current model stream / hooks (TUI passes a shared signal).
+    Stop,
     Cost,
     Resume {
         session_path: Option<String>,
@@ -1272,6 +1301,15 @@ pub fn validate_slash_command_input(
         "clear" => SlashCommand::Clear {
             confirm: parse_clear_args(&args)?,
         },
+        "team" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Team
+        }
+        "memo" => SlashCommand::Memo { text: remainder },
+        "stop" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Stop
+        }
         "cost" => {
             validate_no_args(command, &args)?;
             SlashCommand::Cost
@@ -1801,7 +1839,7 @@ fn slash_command_category(name: &str) -> &'static str {
         "theme" | "vim" | "voice" | "color" | "effort" | "fast" | "brief" | "output-style"
         | "keybindings" | "stickers" => "Appearance & input",
         "copy" | "share" | "feedback" | "summary" | "tag" | "thinkback" | "plan" | "exit"
-        | "upgrade" | "rewind" => "Communication & control",
+        | "upgrade" | "rewind" | "team" | "memo" | "stop" => "Communication & control",
         _ => "Other",
     }
 }
@@ -3254,6 +3292,9 @@ pub fn handle_slash_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::Team
+        | SlashCommand::Memo { .. }
+        | SlashCommand::Stop
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -3454,6 +3495,18 @@ mod tests {
             SlashCommand::parse("/clear --confirm"),
             Ok(Some(SlashCommand::Clear { confirm: true }))
         );
+        assert_eq!(SlashCommand::parse("/team"), Ok(Some(SlashCommand::Team)));
+        assert_eq!(
+            SlashCommand::parse("/memo save this"),
+            Ok(Some(SlashCommand::Memo {
+                text: Some("save this".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/memo"),
+            Ok(Some(SlashCommand::Memo { text: None }))
+        );
+        assert_eq!(SlashCommand::parse("/stop"), Ok(Some(SlashCommand::Stop)));
         assert_eq!(SlashCommand::parse("/cost"), Ok(Some(SlashCommand::Cost)));
         assert_eq!(
             SlashCommand::parse("/resume session.json"),

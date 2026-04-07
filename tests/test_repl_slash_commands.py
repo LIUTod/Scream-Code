@@ -37,6 +37,29 @@ class ReplSlashCommandsTests(unittest.TestCase):
         self.assertTrue(h)
         self.assertIsNone(ne)
 
+    def test_memo_inline_appends_without_llm(self) -> None:
+        old = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                os.chdir(tmp)
+                eng = QueryEnginePort(
+                    build_port_manifest(),
+                    config=QueryEngineConfig(llm_enabled=False),
+                )
+                with patch('builtins.print'):
+                    h, ne = dispatch_repl_slash_command(
+                        '/memo 记住当前使用 Rust 2021 edition',
+                        console=None,
+                        engine=eng,
+                    )
+                self.assertTrue(h)
+                self.assertIsNone(ne)
+                text = Path(tmp, 'SCREAM.md').read_text(encoding='utf-8')
+                self.assertIn('Rust 2021 edition', text)
+                self.assertIn('/memo', text)
+        finally:
+            os.chdir(old)
+
     def test_flush_clears_engine(self) -> None:
         eng = QueryEnginePort(
             build_port_manifest(),

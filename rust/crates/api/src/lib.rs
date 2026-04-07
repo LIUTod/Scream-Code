@@ -32,3 +32,10 @@ pub use telemetry::{
     MemoryTelemetrySink, SessionTraceRecord, SessionTracer, TelemetryEvent, TelemetrySink,
     DEFAULT_ANTHROPIC_VERSION,
 };
+
+/// True when `ANTHROPIC_*` env or saved OAuth can satisfy Anthropic-shaped requests.
+#[inline]
+#[must_use]
+pub fn anthropic_auth_configured() -> bool {
+    crate::providers::anthropic::has_auth_from_env_or_saved().unwrap_or(false)
+}

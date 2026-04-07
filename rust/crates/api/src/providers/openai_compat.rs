@@ -101,6 +101,23 @@ impl OpenAiCompatClient {
         Ok(Self::new(api_key, config))
     }
 
+    /// Same as [`Self::from_env`] but also accepts generic `API_KEY` and `BASE_URL` (Python / `.env` style).
+    pub fn from_env_with_dotenv_aliases(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
+        let api_key = read_env_non_empty(config.api_key_env)?
+            .or(read_env_non_empty("API_KEY")?)
+            .ok_or_else(|| match config.provider_name {
+                "xAI" => ApiError::missing_credentials("xAI", &["XAI_API_KEY", "API_KEY"]),
+                _ => ApiError::missing_credentials(
+                    "OpenAI-compatible",
+                    &["OPENAI_API_KEY", "API_KEY"],
+                ),
+            })?;
+        let base_url = std::env::var(config.base_url_env)
+            .or_else(|_| std::env::var("BASE_URL"))
+            .unwrap_or_else(|_| config.default_base_url.to_string());
+        Ok(Self::new(api_key, config).with_base_url(base_url))
+    }
+
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
@@ -540,6 +557,8 @@ impl ToolCallState {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     id: String,
+    /// Some OpenAI-compatible gateways omit `model` on completion payloads; fall back to the request model.
+    #[serde(default)]
     model: String,
     choices: Vec<ChatChoice>,
     #[serde(default)]
@@ -952,7 +971,8 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, normalize_finish_reason,
-        openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
+        normalize_response, openai_tool_choice, parse_tool_arguments, ChatCompletionResponse,
+        OpenAiCompatClient, OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1100,5 +1120,20 @@ mod tests {
     fn normalizes_stop_reasons() {
         assert_eq!(normalize_finish_reason("stop"), "end_turn");
         assert_eq!(normalize_finish_reason("tool_calls"), "tool_use");
+    }
+
+    #[test]
+    fn chat_completion_response_allows_missing_model() {
+        let v = json!({
+            "id": "chat-1",
+            "choices": [{
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop"
+            }]
+        });
+        let parsed: ChatCompletionResponse = serde_json::from_value(v).expect("deserialize");
+        assert!(parsed.model.is_empty());
+        let normalized = normalize_response("fallback-model", parsed).expect("normalize");
+        assert_eq!(normalized.model, "fallback-model");
     }
 }

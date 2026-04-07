@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from openai import OpenAI
 
+from . import agent_cancel
 from .llm_settings import LlmConnectionSettings
+from .message_prune import prune_historical_messages
 
 
 class LlmClientError(Exception):
@@ -21,8 +24,41 @@ def get_openai_agent_tools() -> list[dict[str, Any]]:
 
     return get_skills_registry().get_all_schemas()
 
-MAX_AGENT_TOOL_ROUNDS = 8
+
+# 可选硬上限（防模型异常死循环）；默认不限制，由 ``while True`` 直到模型不再发起 tool_calls
+_AGENT_TOOL_CAP_ENV = 'SCREAM_MAX_AGENT_TOOL_ROUNDS'
+_AGENT_TOOL_CAP_MAX = 10_000_000
+
+# 兼容旧文档/外部引用：未设置上限时表示「极大」占位，实际循环见 :func:`agent_tool_iteration_cap`
+MAX_AGENT_TOOL_ROUNDS = 0
 ANTHROPIC_STREAM_MAX_TOKENS = 16_384
+
+
+def agent_tool_iteration_cap() -> int | None:
+    """
+    单次用户消息内「模型 ↔ 工具」闭环的最大迭代次数。
+
+    - ``None``：不限制（``while True``，直至 ``finish_reason != tool_calls``）。
+    - 正整数：硬上限；可通过 ``SCREAM_MAX_AGENT_TOOL_ROUNDS`` 设置（最大 10_000_000）。
+
+    以下环境变量取值视为**不限制**：空、``0``、``unlimited``、``none``、``inf``、``infinity``（大小写不敏感）。
+    """
+    raw = (os.environ.get(_AGENT_TOOL_CAP_ENV) or '').strip().lower()
+    if not raw or raw in ('0', 'unlimited', 'none', 'inf', 'infinity'):
+        return None
+    try:
+        n = int(raw, 10)
+    except ValueError:
+        return None
+    if n <= 0:
+        return None
+    return min(n, _AGENT_TOOL_CAP_MAX)
+
+
+def max_agent_tool_rounds() -> int:
+    """兼容测试与旧代码：返回正整数；无上限时返回 ``10**9`` 作为占位。"""
+    cap = agent_tool_iteration_cap()
+    return cap if cap is not None else 10**9
 
 
 @dataclass(frozen=True)
@@ -438,16 +474,18 @@ def chat_completion_stream(
 ) -> Iterator[StreamPart]:
     """按配置的 ``api_protocol`` 选择 OpenAI 或 Anthropic 流式接口。"""
     _raise_if_missing_key(settings)
+    # 内存修剪：不修改调用方传入的 messages（深拷贝在 prune 内完成）
+    api_messages = prune_historical_messages(messages)
     use_model = (model or settings.model).strip() or settings.model
     proto = (settings.api_protocol or 'openai').strip().lower()
     try:
         if proto == 'anthropic':
             yield from _chat_completion_stream_anthropic(
-                messages, settings, use_model=use_model, tools=tools
+                api_messages, settings, use_model=use_model, tools=tools
             )
         else:
             yield from _chat_completion_stream_openai(
-                messages, settings, use_model=use_model, tools=tools
+                api_messages, settings, use_model=use_model, tools=tools
             )
     except Exception as exc:
         mapped = _map_llm_auth_exception(exc)
@@ -484,16 +522,34 @@ def iter_agent_executor_events(
     out_tok = 0
     text_slices: list[str] = []
 
-    for _ in range(MAX_AGENT_TOOL_ROUNDS):
+    cap = agent_tool_iteration_cap()
+    n_iter = 0
+    while cap is None or n_iter < cap:
+        n_iter += 1
+        if agent_cancel.agent_cancel_requested():
+            yield {
+                'type': 'executor_complete',
+                'assistant_text': '用户已中断当前任务。',
+                'input_tokens': in_tok,
+                'output_tokens': out_tok,
+                'conversation_messages': copy.deepcopy(msgs),
+                'stop_reason': 'user_interrupt',
+            }
+            return
+
         acc = ToolCallAccumulator()
         round_buf: list[str] = []
         finish_reason: str | None = None
         round_in = 0
         round_out = 0
+        stream_cancelled = False
         try:
             for part in chat_completion_stream(
                 msgs, settings, model=use_model, tools=use_tools
             ):
+                if agent_cancel.agent_cancel_requested():
+                    stream_cancelled = True
+                    break
                 if part.text_delta:
                     round_buf.append(part.text_delta)
                     yield {'type': 'text_delta', 'text': part.text_delta}
@@ -513,6 +569,24 @@ def iter_agent_executor_events(
 
         in_tok += round_in
         out_tok += round_out
+
+        if stream_cancelled:
+            partial = ''.join(round_buf).strip()
+            tail = (
+                partial + '\n\n用户已中断当前任务。'
+                if partial
+                else '用户已中断当前任务。'
+            )
+            yield {
+                'type': 'executor_complete',
+                'assistant_text': tail,
+                'input_tokens': in_tok,
+                'output_tokens': out_tok,
+                'conversation_messages': copy.deepcopy(msgs),
+                'stop_reason': 'user_interrupt',
+            }
+            return
+
         assistant_round = ''.join(round_buf).strip()
 
         if finish_reason == 'tool_calls' and acc.has_tool_calls():
@@ -526,7 +600,8 @@ def iter_agent_executor_events(
             if assistant_round:
                 assistant_msg['content'] = assistant_round
             msgs.append(assistant_msg)
-            for tc in tool_calls:
+            interrupt_from_here: int | None = None
+            for idx, tc in enumerate(tool_calls):
                 fn = tc['function']['name']
                 raw_args = tc['function']['arguments']
                 yield {
@@ -534,7 +609,13 @@ def iter_agent_executor_events(
                     'tool_name': fn,
                     'arguments': raw_args,
                 }
-                result = reg.execute_tool(fn, raw_args)
+                if agent_cancel.agent_cancel_requested():
+                    interrupt_from_here = idx
+                    break
+                try:
+                    result = reg.execute_tool(fn, raw_args)
+                except Exception as exc:
+                    result = f'[执行失败] {type(exc).__name__}: {exc}'
                 msgs.append(
                     {
                         'role': 'tool',
@@ -542,6 +623,17 @@ def iter_agent_executor_events(
                         'content': result,
                     }
                 )
+            if interrupt_from_here is not None:
+                for tc2 in tool_calls[interrupt_from_here:]:
+                    msgs.append(
+                        {
+                            'role': 'tool',
+                            'tool_call_id': tc2['id'],
+                            'content': agent_cancel.INTERRUPT_TOOL_MESSAGE,
+                        }
+                    )
+                continue
+
             continue
 
         if assistant_round:
@@ -553,12 +645,16 @@ def iter_agent_executor_events(
             'input_tokens': in_tok,
             'output_tokens': out_tok,
             'conversation_messages': copy.deepcopy(msgs),
+            'stop_reason': 'completed',
         }
         return
 
     yield {
         'type': 'llm_error',
-        'output': '[LLM] 工具调用轮次超过上限，请简化任务。',
+        'output': (
+            '[LLM] 工具调用轮次超过配置上限（环境变量 '
+            f'{_AGENT_TOOL_CAP_ENV}），请简化任务。'
+        ),
     }
 
 
@@ -591,7 +687,7 @@ def chat_completion(
                 conversation_messages=None,
             )
     return ChatCompletionResult(
-        text='[LLM] 工具调用轮次超过上限，请简化任务。',
+        text=f'[LLM] 工具调用轮次超过配置上限（{_AGENT_TOOL_CAP_ENV}），请简化任务。',
         input_tokens=0,
         output_tokens=0,
         conversation_messages=None,

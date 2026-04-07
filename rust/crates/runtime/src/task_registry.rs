@@ -76,11 +76,7 @@ impl TaskRegistry {
     }
 
     pub fn create(&self, prompt: &str, description: Option<&str>) -> Task {
-        self.create_task(
-            prompt.to_owned(),
-            description.map(str::to_owned),
-            None,
-        )
+        self.create_task(prompt.to_owned(), description.map(str::to_owned), None)
     }
 
     pub fn create_from_packet(

@@ -599,7 +599,10 @@ mod tests {
             ));
 
             match result {
-                McpPhaseResult::Failure { phase: failed_phase, error } => {
+                McpPhaseResult::Failure {
+                    phase: failed_phase,
+                    error,
+                } => {
                     assert_eq!(failed_phase, phase);
                     assert_eq!(error.phase, phase);
                     assert_eq!(

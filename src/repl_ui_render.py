@@ -50,7 +50,7 @@ _SKILL_TOOLS = frozenset({'install_local_skill'})
 def assistant_panel_title() -> Any:
     from rich.text import Text
 
-    return Text.from_markup('[bold cyan]🤖 尖叫助理[/bold cyan]')
+    return Text.from_markup('[bold cyan]🚀scream code🚀[/bold cyan]')
 
 
 def assistant_panel(inner: Any) -> Any:

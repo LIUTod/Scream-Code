@@ -257,7 +257,9 @@ impl WorkerRegistry {
             let prompt_preview = prompt_preview(worker.last_prompt.as_deref().unwrap_or_default());
             let message = match observation.target {
                 WorkerPromptTarget::Shell => {
-                    format!("worker prompt landed in shell instead of coding agent: {prompt_preview}")
+                    format!(
+                        "worker prompt landed in shell instead of coding agent: {prompt_preview}"
+                    )
                 }
                 WorkerPromptTarget::WrongTarget => format!(
                     "worker prompt landed in the wrong target instead of {}: {}",
@@ -312,7 +314,9 @@ impl WorkerRegistry {
             worker.last_error = None;
         }
 
-        if detect_ready_for_prompt(screen_text, &lowered) && worker.status != WorkerStatus::ReadyForPrompt {
+        if detect_ready_for_prompt(screen_text, &lowered)
+            && worker.status != WorkerStatus::ReadyForPrompt
+        {
             worker.status = WorkerStatus::ReadyForPrompt;
             worker.prompt_in_flight = false;
             if matches!(
@@ -412,7 +416,10 @@ impl WorkerRegistry {
             worker_id: worker.worker_id.clone(),
             status: worker.status,
             ready: worker.status == WorkerStatus::ReadyForPrompt,
-            blocked: matches!(worker.status, WorkerStatus::TrustRequired | WorkerStatus::Failed),
+            blocked: matches!(
+                worker.status,
+                WorkerStatus::TrustRequired | WorkerStatus::Failed
+            ),
             replay_prompt_ready: worker.replay_prompt.is_some(),
             last_error: worker.last_error.clone(),
         })

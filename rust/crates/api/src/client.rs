@@ -28,12 +28,12 @@ impl ProviderClient {
                 Some(auth) => AnthropicClient::from_auth(auth),
                 None => AnthropicClient::from_env()?,
             })),
-            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
+            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env_with_dotenv_aliases(
                 OpenAiCompatConfig::xai(),
             )?)),
-            ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
-                OpenAiCompatConfig::openai(),
-            )?)),
+            ProviderKind::OpenAi => Ok(Self::OpenAi(
+                OpenAiCompatClient::from_env_with_dotenv_aliases(OpenAiCompatConfig::openai())?,
+            )),
         }
     }
 

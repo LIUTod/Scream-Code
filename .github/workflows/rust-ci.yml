@@ -43,8 +43,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-  test-rusty-claude-cli:
-    name: cargo test -p rusty-claude-cli
+  test-scream-cli:
+    name: cargo test -p scream-cli
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,4 +53,4 @@ jobs:
         with:
           workspaces: rust -> target
       - name: Run crate tests
-        run: cargo test -p rusty-claude-cli
+        run: cargo test -p scream-cli

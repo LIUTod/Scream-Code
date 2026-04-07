@@ -49,6 +49,7 @@ temp/
 
 # --- 本地会话落盘（勿提交）---
 .port_sessions/
+.scream/
 
 # --- 可选：编辑器 ---
 .idea/

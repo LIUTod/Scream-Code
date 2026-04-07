@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 
 # 按优先级依次尝试（仅使用 Path.cwd() 下首个可读且非空白的文件）
 PROJECT_MEMORY_FILENAMES: tuple[str, ...] = ('SCREAM.md', 'CLAUDE.md', '.cursorrules')
 MAX_INJECT_CHARS = 80_000
+
+
+def project_memory_workspace_root() -> Path:
+    """
+    查找项目记忆文件时使用的根目录：与会话落盘、文件类工具一致，
+    优先 ``SCREAM_WORKSPACE_ROOT``，否则为进程当前工作目录。
+    """
+    raw = os.environ.get('SCREAM_WORKSPACE_ROOT', '').strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path.cwd().resolve()
 
 
 def read_first_available_project_memory(cwd: Path | None = None) -> tuple[str | None, str | None]:
@@ -41,8 +53,14 @@ def format_project_memory_system_suffix(body: str) -> str:
 
 
 def project_memory_system_suffix(cwd: Path | None = None) -> str:
-    """供 ``build_system_init_message`` 追加的片段；无可用文件时为空串。"""
-    name, body = read_first_available_project_memory(cwd)
+    """
+    供 ``build_system_init_message`` 追加的片段；无可用文件时为空串。
+
+    ``cwd`` 为 ``None`` 时使用 :func:`project_memory_workspace_root`（尊重
+    ``SCREAM_WORKSPACE_ROOT``），避免在安装目录启动时读不到项目下 SCREAM.md。
+    """
+    base = project_memory_workspace_root() if cwd is None else cwd
+    name, body = read_first_available_project_memory(base)
     if not name or body is None:
         return ''
     return format_project_memory_system_suffix(body)
@@ -57,7 +75,7 @@ def long_term_memory_target_path(cwd: Path | None = None) -> Path:
     写入长效记忆时的目标文件：优先已有 ``SCREAM.md``，否则已有 ``CLAUDE.md``，否则新建 ``SCREAM.md``。
     仅追加，不覆盖用户原有正文结构。
     """
-    base = (cwd if cwd is not None else Path.cwd()).resolve()
+    base = (cwd if cwd is not None else project_memory_workspace_root()).resolve()
     scream = base / 'SCREAM.md'
     claude = base / 'CLAUDE.md'
     if scream.is_file():

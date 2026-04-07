@@ -68,4 +68,4 @@
 
 本仓库 **不包含** 闭源的 TypeScript 运行时二进制；**原生** 指 **parity 镜像**（归档清单、路由形状、`turn-loop` CLI 等）所定义的 **契约**。壳层扩展 **不得破坏** 这些契约的可追踪性：新工具进 **SkillsRegistry** 并在 **tool-pool** 中可见。
 
-若需调整多轮 tool 上限或协议细节，应优先修改 **`llm_client`** 中的单一闭环，并同步文档与本文件。
+若需调整多轮 tool 上限或协议细节，应优先修改 **`llm_client`** 中的单一闭环：默认 **不限制** 工具往返（``while True`` 直至模型不再请求工具）；仅当设置正整数 **`SCREAM_MAX_AGENT_TOOL_ROUNDS`** 时启用硬上限。用户中断见 **`agent_cancel`** 与 **`/stop`**、``execute_mac_bash`` 轮询。

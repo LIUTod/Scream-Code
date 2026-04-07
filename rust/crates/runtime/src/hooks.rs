@@ -52,7 +52,7 @@ pub enum HookProgressEvent {
     },
 }
 
-pub trait HookProgressReporter {
+pub trait HookProgressReporter: Send {
     fn on_event(&mut self, event: &HookProgressEvent);
 }
 

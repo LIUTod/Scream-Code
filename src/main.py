@@ -97,6 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help='启用大模型（默认开启；密钥见 llm_config.json 或 .env；--no-llm 仅打印说明后退出）',
     )
+    repl_parser.add_argument(
+        '--json-stdio',
+        action='store_true',
+        help='行协议 JSON stdio：供 Rust 全屏 TUI 等前端驱动；stdout 仅输出 JSON 行，stdin 每行一条 JSON 指令',
+    )
     subparsers.add_parser('config', help='交互式管理多模型配置（llm_config.json）')
     subparsers.add_parser('summary', help='以 Markdown 渲染 Python 移植工作区摘要')
     subparsers.add_parser('manifest', help='打印当前 Python 工作区清单')
@@ -210,12 +215,41 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     manifest = build_port_manifest()
     if args.command == 'repl':
+        if getattr(args, 'json_stdio', False):
+            from .replLauncher import run_repl_json_stdio_loop
+
+            if args.llm:
+                from .llm_onboarding import ensure_llm_ready_interactive
+
+                if not ensure_llm_ready_interactive():
+                    return 1
+            try:
+                return run_repl_json_stdio_loop(llm_enabled=args.llm, route_limit=5)
+            except KeyboardInterrupt:
+                return 130
+            except Exception as exc:
+                print(
+                    f'[REPL json-stdio] {type(exc).__name__}: {exc}',
+                    flush=True,
+                    file=sys.stderr,
+                )
+                return 1
         if args.llm:
             from .llm_onboarding import ensure_llm_ready_interactive
 
             if not ensure_llm_ready_interactive():
                 return 1
-            return run_repl_interactive_loop(llm_enabled=True)
+            try:
+                return run_repl_interactive_loop(llm_enabled=True)
+            except KeyboardInterrupt:
+                print('\n已中断。', flush=True)
+                return 130
+            except Exception as exc:
+                print(
+                    f'[REPL] 未捕获异常（进程仍保持退出码非零）: {type(exc).__name__}: {exc}',
+                    flush=True,
+                )
+                return 1
         print_startup_banner()
         print_project_memory_loaded_notice()
         print(build_repl_banner())
@@ -315,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f'{session.session_id}\n'
             f'消息条数={len(session.messages)}\n'
+            f'LLM 快照条数={len(session.llm_conversation_messages)}\n'
             f'入站 token={session.input_tokens} 出站 token={session.output_tokens}',
         )
         return 0

@@ -1,0 +1,937 @@
+//! Full-screen REPL: **pure UI**. All LLM / `/team` / `/memo` / routing runs in the Python
+//! `QueryEnginePort` stack (`python3 -m src.main repl --json-stdio`); this module only renders
+//! JSON lines from stdout and sends JSON lines on stdin.
+
+mod render;
+
+use std::env;
+use std::io::{self, stdout, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+use crossterm::{
+    cursor::{Hide, Show},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Position},
+    prelude::*,
+    style::Modifier,
+    widgets::{Block, Borders, Paragraph, Wrap},
+};
+use runtime::PermissionMode;
+use serde_json::Value;
+use strip_ansi_escapes::strip;
+use textwrap::WordSeparator;
+use tui_textarea::TextArea;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use super::resolve_git_branch_for;
+
+const BG: Color = Color::Rgb(10, 14, 24);
+const BORDER: Color = Color::Cyan;
+const ACCENT: Color = Color::Rgb(96, 168, 255);
+const TEXT: Color = Color::Rgb(170, 210, 245);
+const STATUS_BG: Color = Color::Rgb(0, 140, 190);
+const STATUS_FG: Color = Color::Rgb(8, 12, 20);
+const INPUT_LINE_BG: Color = Color::Rgb(18, 28, 48);
+
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn strip_ansi_for_tui(s: &str) -> String {
+    String::from_utf8_lossy(&strip(s.as_bytes())).to_string()
+}
+
+fn textwrap_options(content_width: usize) -> textwrap::Options<'static> {
+    textwrap::Options::new(content_width)
+        .word_separator(WordSeparator::UnicodeBreakProperties)
+        .break_words(true)
+}
+
+fn hide_textarea_buffer_caret(textarea: &mut TextArea<'_>) {
+    textarea.set_cursor_style(Style::default().add_modifier(Modifier::HIDDEN));
+}
+
+#[inline]
+fn next_scroll_top(prev_top: u16, cursor: u16, viewport_len: u16) -> u16 {
+    if viewport_len == 0 {
+        return prev_top;
+    }
+    if cursor < prev_top {
+        cursor
+    } else if prev_top.saturating_add(viewport_len) <= cursor {
+        cursor.saturating_add(1).saturating_sub(viewport_len)
+    } else {
+        prev_top
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TextViewportScroll {
+    top_row: u16,
+    top_col: u16,
+}
+
+fn usize_to_u16_saturated(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+fn display_width_char_range(line: &str, char_start: usize, char_end: usize) -> u16 {
+    if char_end <= char_start {
+        return 0;
+    }
+    let w: usize = line
+        .chars()
+        .enumerate()
+        .filter(|(i, _)| *i >= char_start && *i < char_end)
+        .map(|(_, c)| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
+    u16::try_from(w.min(u16::MAX as usize)).unwrap_or(u16::MAX)
+}
+
+fn textarea_cursor_absolute(
+    textarea: &TextArea<'_>,
+    input_area: Rect,
+    prev: TextViewportScroll,
+    term: Rect,
+) -> Option<Position> {
+    let inner = textarea
+        .block()
+        .map(|b| b.inner(input_area))
+        .unwrap_or(input_area);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    let (cr, cc) = textarea.cursor();
+    let h = inner.height.max(1);
+    let w = inner.width.max(1);
+    let top_row = next_scroll_top(prev.top_row, usize_to_u16_saturated(cr), h);
+    let top_col = next_scroll_top(prev.top_col, usize_to_u16_saturated(cc), w);
+
+    let rel_y = usize_to_u16_saturated(cr).saturating_sub(top_row);
+    let rel_y = rel_y.min(inner.height.saturating_sub(1));
+
+    let line = textarea.lines().get(cr).map(String::as_str).unwrap_or("");
+    let tc = top_col as usize;
+    let dx = display_width_char_range(line, tc, cc);
+    let rel_x = dx.min(inner.width.saturating_sub(1));
+
+    let mut x = inner.x.saturating_add(rel_x);
+    let mut y = inner.y.saturating_add(rel_y);
+    let max_x = term.x.saturating_add(term.width.saturating_sub(1));
+    let max_y = term.y.saturating_add(term.height.saturating_sub(1));
+    x = x.max(term.x).min(max_x);
+    y = y.max(term.y).min(max_y);
+    Some(Position::new(x, y))
+}
+
+fn flatten_wrapped_chat_lines(lines: &[String], content_width: usize) -> Vec<String> {
+    if content_width == 0 {
+        return lines.to_vec();
+    }
+    let opts = textwrap_options(content_width);
+    let mut out = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let wrapped = textwrap::wrap(line, &opts);
+        if wrapped.is_empty() {
+            out.push(String::new());
+        } else {
+            for w in wrapped {
+                out.push(w.into_owned());
+            }
+        }
+    }
+    out
+}
+
+fn permission_mode_zh(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::ReadOnly => "只读",
+        PermissionMode::WorkspaceWrite => "工作区写入",
+        PermissionMode::DangerFullAccess => "完全访问",
+        PermissionMode::Prompt => "询问",
+        PermissionMode::Allow => "允许",
+    }
+}
+
+struct ChatLog {
+    lines: Vec<String>,
+    assistant_stream_line: Option<usize>,
+}
+
+impl ChatLog {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            assistant_stream_line: None,
+        }
+    }
+
+    fn push_section(&mut self, title: &str, body: &str) {
+        let title = strip_ansi_for_tui(title);
+        let body = strip_ansi_for_tui(body);
+        self.lines.push(format!("— {title} —"));
+        if body.is_empty() {
+            self.lines.push("∅".to_string());
+        } else {
+            for line in body.lines() {
+                self.lines.push(line.to_string());
+            }
+        }
+        self.lines.push(String::new());
+        self.lines.push(String::new());
+    }
+
+    fn push_plain(&mut self, line: impl Into<String>) {
+        self.lines.push(strip_ansi_for_tui(&line.into()));
+        self.lines.push(String::new());
+        self.lines.push(String::new());
+    }
+
+    fn clear_all(&mut self) {
+        self.lines.clear();
+        self.assistant_stream_line = None;
+    }
+
+    fn pop_last_plain_block(&mut self) {
+        let n = self.lines.len();
+        if n >= 2 {
+            self.lines.truncate(n.saturating_sub(2));
+        }
+    }
+
+    fn begin_assistant_stream(&mut self) {
+        if self.assistant_stream_line.is_none() {
+            self.lines.push("— 助手 —".to_string());
+            self.lines.push(String::new());
+            self.lines.push(String::new());
+            self.assistant_stream_line = Some(self.lines.len() - 1);
+        }
+    }
+
+    fn append_assistant_delta(&mut self, d: &str) {
+        let t = strip_ansi_for_tui(d);
+        if t.is_empty() {
+            return;
+        }
+        self.begin_assistant_stream();
+        if let Some(i) = self.assistant_stream_line {
+            self.lines[i].push_str(&t);
+        }
+    }
+
+    fn end_assistant_stream_if_any(&mut self) {
+        if self.assistant_stream_line.take().is_some() {
+            self.lines.push(String::new());
+            self.lines.push(String::new());
+        }
+    }
+
+    /// Map Python `QueryEnginePort` / `iter_repl_assistant_events` JSON events into scrollback.
+    fn handle_python_json(&mut self, v: &Value) {
+        let Some(ty) = v.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        match ty {
+            "text_delta" => {
+                if let Some(t) = v.get("text").and_then(Value::as_str) {
+                    self.append_assistant_delta(t);
+                }
+            }
+            "api_tool_op" => {
+                self.end_assistant_stream_if_any();
+                let name = v.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
+                let args = v
+                    .get("arguments")
+                    .map(|x| {
+                        x.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| x.to_string())
+                    })
+                    .unwrap_or_default();
+                self.push_section("工具", &format!("{name}\n{args}"));
+            }
+            "tool_phase" => {
+                let label = v
+                    .get("tools")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|i| i.as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                if !label.is_empty() {
+                    self.push_plain(format!("⚙️ 正在执行工具: {label}"));
+                }
+            }
+            "finished" | "non_llm" => {
+                let out = v.get("output").and_then(Value::as_str).unwrap_or("");
+                let had_stream = self
+                    .assistant_stream_line
+                    .and_then(|i| self.lines.get(i).map(|s| !s.trim().is_empty()))
+                    .unwrap_or(false);
+                self.end_assistant_stream_if_any();
+                if !had_stream && !out.trim().is_empty() {
+                    self.push_section("助手", out);
+                }
+            }
+            "llm_error" | "blocked" => {
+                self.end_assistant_stream_if_any();
+                let msg = v.get("output").and_then(Value::as_str).unwrap_or("error");
+                self.push_section("错误", msg);
+            }
+            _ => {
+                // 哑终端：未单独映射的事件仍展示 Python 给出的可读片段（不做指令路由）。
+                if let Some(s) = v
+                    .get("text")
+                    .or_else(|| v.get("output"))
+                    .or_else(|| v.get("message"))
+                    .and_then(Value::as_str)
+                {
+                    if !s.trim().is_empty() {
+                        self.push_section("后端", s);
+                    }
+                } else if let Some(a) = v.get("agent").and_then(Value::as_str) {
+                    self.push_section("后端", a);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TuiSnapshot {
+    model: String,
+    permission: PermissionMode,
+    total_tokens: u64,
+}
+
+impl Default for TuiSnapshot {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            permission: PermissionMode::WorkspaceWrite,
+            total_tokens: 0,
+        }
+    }
+}
+
+impl TuiSnapshot {
+    fn apply_from_json(&mut self, v: &Value) {
+        if let Some(m) = v.get("model").and_then(Value::as_str) {
+            self.model = m.to_string();
+        }
+        let cin = v
+            .get("cumulative_input_tokens")
+            .and_then(|x| x.as_u64())
+            .or_else(|| {
+                v.get("cumulative_input_tokens")
+                    .and_then(|x| x.as_i64())
+                    .map(|i| i.max(0) as u64)
+            })
+            .unwrap_or(0);
+        let cout = v
+            .get("cumulative_output_tokens")
+            .and_then(|x| x.as_u64())
+            .or_else(|| {
+                v.get("cumulative_output_tokens")
+                    .and_then(|x| x.as_i64())
+                    .map(|i| i.max(0) as u64)
+            })
+            .unwrap_or(0);
+        if v.get("cumulative_input_tokens").is_some() || v.get("cumulative_output_tokens").is_some()
+        {
+            self.total_tokens = cin.saturating_add(cout);
+        }
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    env::var("SCREAM_WORKSPACE_ROOT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default())
+}
+
+fn python_executable() -> &'static str {
+    if cfg!(windows) {
+        "python"
+    } else {
+        "python3"
+    }
+}
+
+enum BackendLine {
+    Stdout(String),
+    Stderr(String),
+}
+
+fn spawn_python_backend() -> Result<
+    (
+        std::process::Child,
+        mpsc::Receiver<BackendLine>,
+        std::process::ChildStdin,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let mut child = Command::new(python_executable())
+        .args(["-m", "src.main", "repl", "--json-stdio"])
+        .current_dir(workspace_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("SCREAM_REPL_JSON_STDIO", "1")
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("python backend: missing stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("python backend: missing stderr")?;
+    let stdin = child.stdin.take().ok_or("python backend: missing stdin")?;
+
+    let (tx, rx) = mpsc::channel::<BackendLine>();
+    let tx_out = tx.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    if tx_out.send(BackendLine::Stdout(l)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    thread::spawn(move || {
+        let r = BufReader::new(stderr);
+        for line in r.lines() {
+            if let Ok(l) = line {
+                if tx.send(BackendLine::Stderr(l)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok((child, rx, stdin))
+}
+
+fn project_label(cwd: &Path) -> String {
+    cwd.file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| cwd.display().to_string())
+}
+
+fn status_left_line(snap: &TuiSnapshot) -> Line<'static> {
+    let cwd = env::current_dir().unwrap_or_default();
+    let dir = project_label(&cwd);
+    let branch = resolve_git_branch_for(&cwd)
+        .map(|b| format!(" · {b}"))
+        .unwrap_or_default();
+    let meta = format!(
+        "  {dir}  ·  模型 {}  ·  {}{}",
+        snap.model,
+        permission_mode_zh(snap.permission),
+        branch
+    );
+    Line::from(vec![
+        Span::styled(
+            "🚀Scream Code🚀",
+            Style::default().fg(Color::Rgb(255, 255, 255)).bold(),
+        ),
+        Span::styled(meta, Style::default().fg(STATUS_FG)),
+    ])
+}
+
+fn status_right_line(snap: &TuiSnapshot, busy: bool) -> Line<'static> {
+    let text = if busy {
+        "Python 后端响应中…".to_string()
+    } else {
+        format!("累计 Token：{}", snap.total_tokens)
+    };
+    Line::from(Span::styled(text, Style::default().fg(STATUS_FG)))
+}
+
+fn style_chat_row(s: &str) -> Line<'static> {
+    let t = s.to_string();
+    match t.as_str() {
+        "— 你 —" => Line::from(Span::styled(
+            t,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        "— 助手 —" => Line::from(Span::styled(
+            t,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
+        "— 工具 —" | "— 错误 —" | "— 系统 —" => Line::from(Span::styled(
+            t,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )),
+        _ => Line::from(Span::styled(t, Style::default().fg(TEXT))),
+    }
+}
+
+fn suspend(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+fn resume(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    enable_raw_mode()?;
+    terminal.clear()?;
+    Ok(())
+}
+
+fn build_textarea() -> TextArea<'static> {
+    let mut textarea = TextArea::default();
+    textarea.set_style(Style::default().fg(TEXT));
+    textarea.set_cursor_line_style(Style::default().bg(INPUT_LINE_BG));
+    textarea.set_cursor_style(Style::default().add_modifier(Modifier::HIDDEN));
+    textarea
+        .set_placeholder_text("尖叫> (Shift+Enter 换行，Enter 发送 · 由 Python QueryEngine 执行)");
+    textarea.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BORDER))
+            .title(Line::from(vec![
+                Span::styled(" 输入 ", Style::default().fg(ACCENT).bold()),
+                Span::styled(" · Enter 发送 ", Style::default().fg(Color::DarkGray)),
+            ])),
+    );
+    textarea
+}
+
+struct SpinnerDrawCtx {
+    tick: usize,
+    waiting_first_token: bool,
+    after_tool: bool,
+}
+
+fn spinner_label(ctx: &SpinnerDrawCtx) -> String {
+    let frame = SPINNER_FRAMES[ctx.tick % SPINNER_FRAMES.len()];
+    let rest = if ctx.after_tool {
+        "⚙️ Python 正在执行工具…"
+    } else if ctx.waiting_first_token {
+        "🧠 Python 编排中…"
+    } else {
+        "🧠 正在生成回复…"
+    };
+    format!("{frame}  {rest}")
+}
+
+fn draw_ui(
+    f: &mut Frame<'_>,
+    snap: &TuiSnapshot,
+    busy: bool,
+    chat: &ChatLog,
+    textarea: &TextArea<'_>,
+    main: Rect,
+    input_h: u16,
+    spinner_ctx: Option<&SpinnerDrawCtx>,
+    textarea_viewport: &mut TextViewportScroll,
+) {
+    let term = f.area();
+    f.render_widget(Block::default().style(Style::default().bg(BG)), term);
+
+    let spinner_h = u16::from(spinner_ctx.is_some());
+    let status_h = 1u16;
+    let chat_h = main
+        .height
+        .saturating_sub(spinner_h)
+        .saturating_sub(input_h)
+        .saturating_sub(status_h)
+        .max(1);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(chat_h),
+            Constraint::Length(spinner_h),
+            Constraint::Length(input_h),
+            Constraint::Length(status_h),
+        ])
+        .split(main);
+
+    let chat_area = chunks[0];
+    let spinner_area = chunks[1];
+    let input_area = chunks[2];
+    let status_area = chunks[3];
+
+    let chat_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .title(Span::styled(
+            " 🚀Scream Code🚀 ",
+            Style::default().fg(Color::White).bold(),
+        ));
+
+    let inner = chat_block.inner(chat_area);
+    let inner_w = inner.width as usize;
+    let inner_h = inner.height.max(1);
+    let visible = usize::from(inner_h);
+
+    if chat.lines.is_empty() {
+        render::render_idle_splash(f, chat_area, chat_block, BG);
+    } else {
+        let flattened = flatten_wrapped_chat_lines(&chat.lines, inner_w.max(1));
+        let start = flattened.len().saturating_sub(visible);
+        let slice = &flattened[start..];
+        let styled_lines: Vec<Line> = slice.iter().map(|s| style_chat_row(s.as_str())).collect();
+        let para = Paragraph::new(Text::from(styled_lines))
+            .block(chat_block)
+            .style(Style::default().bg(BG))
+            .wrap(Wrap { trim: false });
+        f.render_widget(para, chat_area);
+    }
+
+    if let Some(ctx) = spinner_ctx {
+        let spin_line = Line::from(vec![Span::styled(
+            spinner_label(ctx),
+            Style::default().fg(BORDER).bg(BG),
+        )]);
+        f.render_widget(
+            Paragraph::new(spin_line)
+                .style(Style::default().bg(BG))
+                .alignment(Alignment::Left),
+            spinner_area,
+        );
+    }
+
+    f.render_widget(textarea, input_area);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(status_area);
+
+    let status_base = Style::default().bg(STATUS_BG);
+    f.render_widget(
+        Paragraph::new(status_left_line(snap))
+            .style(status_base)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false }),
+        cols[0],
+    );
+    f.render_widget(
+        Paragraph::new(status_right_line(snap, busy))
+            .style(status_base)
+            .alignment(Alignment::Right)
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
+
+    let prev_vp = *textarea_viewport;
+    let inner = textarea
+        .block()
+        .map(|b| b.inner(input_area))
+        .unwrap_or(input_area);
+    if inner.width > 0 && inner.height > 0 {
+        let (cr, cc) = textarea.cursor();
+        let top_row = next_scroll_top(
+            prev_vp.top_row,
+            usize_to_u16_saturated(cr),
+            inner.height.max(1),
+        );
+        let top_col = next_scroll_top(
+            prev_vp.top_col,
+            usize_to_u16_saturated(cc),
+            inner.width.max(1),
+        );
+        *textarea_viewport = TextViewportScroll { top_row, top_col };
+        if let Some(p) = textarea_cursor_absolute(textarea, input_area, prev_vp, term) {
+            f.set_cursor_position(p);
+        }
+    }
+}
+
+fn process_backend_line(
+    line: &str,
+    chat: &mut ChatLog,
+    snap: &mut TuiSnapshot,
+    stream_opened: &mut bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let v: Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            chat.push_section(
+                "后端 (非 JSON 行)",
+                &format!("{e}\n{}", line.chars().take(2000).collect::<String>()),
+            );
+            return Ok(false);
+        }
+    };
+    let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+    match ty {
+        "turn_done" => return Ok(true),
+        "ready" | "state" => snap.apply_from_json(&v),
+        "error" => {
+            let m = v.get("message").and_then(Value::as_str).unwrap_or("error");
+            chat.push_section("错误", m);
+        }
+        "system" => {
+            let t = v.get("text").and_then(Value::as_str).unwrap_or("");
+            chat.push_section("系统", t);
+        }
+        "shutdown_ack" => {}
+        _ => {
+            if ty == "text_delta" && !*stream_opened {
+                chat.pop_last_plain_block();
+                *stream_opened = true;
+            }
+            if matches!(ty, "api_tool_op" | "tool_phase") {
+                *stream_opened = true;
+            }
+            chat.handle_python_json(&v);
+        }
+    }
+    Ok(false)
+}
+
+/// Full-screen TUI backed by Python `repl --json-stdio` (``QueryEnginePort`` / ``llm_client``).
+pub fn run_tui_repl() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut child, rx, mut stdin) = spawn_python_backend()?;
+
+    let mut last_snap = TuiSnapshot::default();
+    let mut pending_stderr: Vec<String> = Vec::new();
+    let first_line = loop {
+        match rx.recv().map_err(|_| "python backend 无输出即退出")? {
+            BackendLine::Stdout(s) => break s,
+            BackendLine::Stderr(s) => pending_stderr.push(s),
+        }
+    };
+
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen, Hide)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+
+    let mut chat = ChatLog::new();
+    for s in pending_stderr {
+        chat.push_section("Python stderr", &strip_ansi_for_tui(&s));
+    }
+    let mut stream_handshake = false;
+    match serde_json::from_str::<Value>(first_line.trim()) {
+        Ok(v) => {
+            if v.get("type").and_then(Value::as_str) == Some("ready") {
+                last_snap.apply_from_json(&v);
+            } else {
+                process_backend_line(
+                    &first_line,
+                    &mut chat,
+                    &mut last_snap,
+                    &mut stream_handshake,
+                )?;
+            }
+        }
+        Err(e) => {
+            chat.push_section(
+                "首行解析失败",
+                &format!("{e}\n{}", first_line.chars().take(2000).collect::<String>()),
+            );
+        }
+    }
+
+    let mut textarea = build_textarea();
+    let mut textarea_scroll = TextViewportScroll::default();
+    let input_height = 8u16;
+    let mut busy = false;
+    let mut ui_tick: usize = 0;
+    const UI_FRAME_MS: u64 = 50;
+
+    let run_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut stream_opened = false;
+        loop {
+            let mut turn_done = false;
+            while let Ok(msg) = rx.try_recv() {
+                let line = match msg {
+                    BackendLine::Stdout(l) => l,
+                    BackendLine::Stderr(l) => {
+                        chat.push_section("Python stderr", &strip_ansi_for_tui(&l));
+                        continue;
+                    }
+                };
+                if process_backend_line(&line, &mut chat, &mut last_snap, &mut stream_opened)? {
+                    turn_done = true;
+                    stream_opened = false;
+                    break;
+                }
+            }
+            if turn_done {
+                busy = false;
+            }
+
+            let spinner_ctx = if busy {
+                Some(SpinnerDrawCtx {
+                    tick: ui_tick,
+                    waiting_first_token: !stream_opened,
+                    after_tool: chat.lines.iter().rev().take(8).any(|l| l.contains("工具")),
+                })
+            } else {
+                None
+            };
+
+            hide_textarea_buffer_caret(&mut textarea);
+            terminal.draw(|f| {
+                draw_ui(
+                    f,
+                    &last_snap,
+                    busy,
+                    &chat,
+                    &textarea,
+                    f.area(),
+                    input_height,
+                    spinner_ctx.as_ref(),
+                    &mut textarea_scroll,
+                );
+            })?;
+
+            if event::poll(Duration::from_millis(UI_FRAME_MS))? {
+                let event = event::read()?;
+                let Event::Key(key) = event else {
+                    continue;
+                };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
+                    let _ = stdin.flush();
+                    let _ = child.wait();
+                    break;
+                }
+
+                let submit =
+                    key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT);
+
+                if submit {
+                    let lines: Vec<String> = textarea.lines().to_vec();
+                    let raw = lines.join("\n");
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    if busy && trimmed == "/stop" {
+                        writeln!(stdin, r#"{{"op":"stop"}}"#)?;
+                        stdin.flush()?;
+                        textarea = build_textarea();
+                        textarea_scroll = TextViewportScroll::default();
+                        continue;
+                    }
+                    if busy {
+                        continue;
+                    }
+
+                    if matches!(trimmed, "/exit" | "/quit") {
+                        writeln!(stdin, r#"{{"op":"shutdown"}}"#)?;
+                        stdin.flush()?;
+                        let _ = child.wait();
+                        break;
+                    }
+
+                    chat.push_section("你", trimmed);
+                    chat.push_plain("… 正在思考 …");
+                    let payload = serde_json::json!({ "op": "submit", "text": trimmed });
+                    writeln!(stdin, "{payload}")?;
+                    stdin.flush()?;
+                    busy = true;
+                    textarea = build_textarea();
+                    textarea_scroll = TextViewportScroll::default();
+                    continue;
+                }
+
+                textarea.input(key);
+            } else if busy {
+                ui_tick = ui_tick.wrapping_add(1);
+            }
+        }
+        Ok(())
+    })();
+
+    let _ = writeln!(stdin, r#"{{"op":"shutdown"}}"#);
+    let _ = stdin.flush();
+    let _ = child.wait();
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)?;
+    terminal.show_cursor()?;
+    run_result
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::{display_width_char_range, next_scroll_top};
+
+    #[test]
+    fn next_scroll_top_keeps_cursor_visible() {
+        assert_eq!(next_scroll_top(0, 3, 5), 0);
+        assert_eq!(next_scroll_top(0, 5, 5), 1);
+        assert_eq!(next_scroll_top(2, 1, 5), 1);
+    }
+
+    #[test]
+    fn display_width_counts_wide_chars() {
+        assert_eq!(display_width_char_range("你好", 0, 1), 2);
+        assert_eq!(display_width_char_range("你好", 0, 2), 4);
+        assert_eq!(display_width_char_range("a你", 0, 2), 3);
+    }
+}
+
+#[cfg(test)]
+mod ansi_tests {
+    use super::{flatten_wrapped_chat_lines, strip_ansi_for_tui};
+
+    #[test]
+    fn wrap_splits_long_logical_line() {
+        let s = "a".repeat(50);
+        let lines = vec![s];
+        let out = flatten_wrapped_chat_lines(&lines, 20);
+        assert!(
+            out.iter().all(|row| row.chars().count() <= 20),
+            "each row should fit width: {out:?}"
+        );
+        assert!(out.len() >= 2, "expected multiple rows: {out:?}");
+    }
+
+    #[test]
+    fn strips_sgr_cyan() {
+        let raw = "\x1b[36mvisible\x1b[0m";
+        assert_eq!(strip_ansi_for_tui(raw), "visible");
+    }
+
+    #[test]
+    fn strips_bold_yellow_style() {
+        let raw = "\x1b[1;33mwarn\x1b[0m";
+        assert_eq!(strip_ansi_for_tui(raw), "warn");
+    }
+}
