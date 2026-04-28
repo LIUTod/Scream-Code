@@ -1,6 +1,8 @@
+![Uploading image.png…]()
+
 # Scream Code
 
-> 一个中文友好、Local-First 的 AI 工程终端。
+> 一个中文友好、Local-First 的 AI Agent终端助手。
 >
 > 目标不是"聊天更花哨"，而是让 AI 在你的机器上接管真实生产力链路。
 
