@@ -1,4 +1,4 @@
-![Uploading image.png…]()
+<img width="1267" height="411" alt="1111" src="https://github.com/user-attachments/assets/a5e50df1-af96-4582-b543-c072fa90f5bb" />
 
 # Scream Code
 
